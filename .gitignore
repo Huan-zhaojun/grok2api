@@ -56,3 +56,7 @@ htmlcov/
 # Project specific
 config.local.toml
 .ace-tool/
+
+# Claude Code
+.claude/settings.local.json
+.claude/index.json

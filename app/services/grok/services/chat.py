@@ -463,6 +463,7 @@ class ChatService:
                 result = await CollectProcessor(
                     model_name,
                     token,
+                    show_think,
                     tools=tools,
                     tool_choice=tool_choice,
                     prompt_tokens=prompt_tokens,
@@ -983,11 +984,13 @@ class CollectProcessor(proc_base.BaseProcessor):
         self,
         model: str,
         token: str = "",
+        show_think: bool = False,
         tools: List[Dict[str, Any]] = None,
         tool_choice: Any = None,
         prompt_tokens: int = 0,
     ):
         super().__init__(model, token)
+        self.show_think = bool(show_think)
         self.filter_tags = get_config("app.filter_tags")
         self.tools = tools
         self.tool_choice = tool_choice
@@ -1033,6 +1036,9 @@ class CollectProcessor(proc_base.BaseProcessor):
         content = ""
         # 兜底收集非 thinking 且无 messageStepId 的最终内容 token
         fallback_tokens: list[str] = []
+        # 收集 thinking token（show_think 开启时用于输出思维链）
+        thinking_tokens: list[str] = []
+        content_started = False
         idle_timeout = get_config("chat.stream_timeout")
 
         try:
@@ -1052,11 +1058,19 @@ class CollectProcessor(proc_base.BaseProcessor):
                 if (llm := resp.get("llmInfo")) and not fingerprint:
                     fingerprint = llm.get("modelHash", "")
 
-                # 收集非 thinking 且无 messageStepId 的 token（最终内容兜底）
+                # 按 thinking 状态分流收集 token
                 is_thinking = bool(resp.get("isThinking"))
                 has_step_id = bool(resp.get("messageStepId"))
-                if not is_thinking and not has_step_id:
-                    if tok := resp.get("token"):
+                in_think = is_thinking or has_step_id
+                if tok := resp.get("token"):
+                    if in_think:
+                        # 正式内容已开始后，丢弃中途插入的 Agent 思考（与 StreamProcessor 对齐）
+                        if not content_started and self.show_think:
+                            thinking_tokens.append(tok)
+                    else:
+                        if tok.strip():
+                            content_started = True
+                        # 收集非 thinking 且无 messageStepId 的 token（最终内容兜底）
                         fallback_tokens.append(tok)
 
                 if mr := resp.get("modelResponse"):
@@ -1161,6 +1175,12 @@ class CollectProcessor(proc_base.BaseProcessor):
         # modelResponse.message 为空时（多智能体模型），用兜底 token 拼接
         if not content and fallback_tokens:
             content = "".join(fallback_tokens)
+
+        # 思维链拼接：将 thinking token 用 <think> 标签包裹后前置到内容（在过滤前拼接，确保 xai 标签被统一过滤）
+        if thinking_tokens and self.show_think:
+            thinking_text = "".join(thinking_tokens).strip()
+            if thinking_text:
+                content = f"<think>\n{thinking_text}\n</think>\n{content}"
 
         content = self._filter_content(content)
 

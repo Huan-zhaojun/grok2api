@@ -503,6 +503,9 @@ def validate_request(request: ChatCompletionRequest):
                 param="stream",
                 code="invalid_stream",
             )
+    else:
+        # OpenAI API 规范: stream 未指定时默认 false
+        request.stream = False
 
     allowed_efforts = {"none", "minimal", "low", "medium", "high", "xhigh"}
     if request.reasoning_effort is not None:
@@ -719,9 +722,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 code="missing_image",
             )
 
-        is_stream = (
-            request.stream if request.stream is not None else get_config("app.stream")
-        )
+        is_stream = request.stream
         image_conf = request.image_config or ImageConfig()
         _validate_image_config(image_conf, stream=bool(is_stream))
         response_format = _resolve_image_format(image_conf.response_format)
@@ -772,9 +773,7 @@ async def chat_completions(request: ChatCompletionRequest):
     if model_info and model_info.is_image:
         prompt, _ = _extract_prompt_images(request.messages)
 
-        is_stream = (
-            request.stream if request.stream is not None else get_config("app.stream")
-        )
+        is_stream = request.stream
         image_conf = _imagine_fast_server_image_config() if request.model == IMAGINE_FAST_MODEL_ID else (request.image_config or ImageConfig())
         _validate_image_config(image_conf, stream=bool(is_stream))
         response_format = _resolve_image_format(image_conf.response_format)
@@ -849,7 +848,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 preset=v_conf.preset,
             )
         except Exception as e:
-            if request.stream is not False:
+            if request.stream:
                 return _streaming_error_response(e)
             raise
     else:
@@ -866,7 +865,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 parallel_tool_calls=request.parallel_tool_calls,
             )
         except Exception as e:
-            if request.stream is not False:
+            if request.stream:
                 return _streaming_error_response(e)
             raise
 

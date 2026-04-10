@@ -463,7 +463,6 @@ class ChatService:
                 result = await CollectProcessor(
                     model_name,
                     token,
-                    show_think,
                     tools=tools,
                     tool_choice=tool_choice,
                     prompt_tokens=prompt_tokens,
@@ -538,8 +537,8 @@ class StreamProcessor(proc_base.BaseProcessor):
         self.fingerprint: str = ""
         self.rollout_id: str = ""
         self.think_opened: bool = False
+        self.think_closed_once: bool = False
         self.image_think_active: bool = False
-        self._content_started: bool = False
         self.role_sent: bool = False
         self.filter_tags = get_config("app.filter_tags")
         self.tool_usage_enabled = (
@@ -817,6 +816,7 @@ class StreamProcessor(proc_base.BaseProcessor):
                     if self.image_think_active and self.think_opened:
                         yield self._sse("\n</think>\n")
                         self.think_opened = False
+                        self.think_closed_once = True
                     self.image_think_active = False
                     for url in proc_base._collect_images(mr):
                         parts = url.split("/")
@@ -860,26 +860,15 @@ class StreamProcessor(proc_base.BaseProcessor):
                 if (token := resp.get("token")) is not None:
                     if not token:
                         continue
+                    if is_thinking and self.think_closed_once and not self.image_think_active:
+                        continue
                     filtered = self._filter_token(token)
                     if not filtered:
                         continue
-                    # 判断是否在 Agent 思考/处理阶段：
-                    #   - isThinking=true → 归入 think
-                    #   - 有 messageStepId → Agent 处理中，归入 think
-                    #   - image_think_active → 图片生成中
-                    #   正式内容开始后，丢弃中途插入的思考（Grok 官网也隐藏了这部分）
-                    has_step_id = bool(resp.get("messageStepId"))
                     in_think = (
-                        is_thinking
-                        or has_step_id
+                        (is_thinking and not self.think_closed_once)
                         or self.image_think_active
                     )
-                    # 正式内容已开始后，丢弃中途插入的 Agent 思考（1-2 句内部注释，无用户价值）
-                    if self._content_started and in_think and not self.image_think_active:
-                        continue
-                    # 空 token 不关闭 think 块（搜索结果间的空 token 不算正式内容）
-                    if not in_think and not filtered.strip():
-                        continue
                     if in_think:
                         if not self.show_think:
                             continue
@@ -890,7 +879,7 @@ class StreamProcessor(proc_base.BaseProcessor):
                         if self.think_opened:
                             yield self._sse("\n</think>\n")
                             self.think_opened = False
-                            self._content_started = True
+                            self.think_closed_once = True
 
                     if in_think:
                         self._record_content(filtered)
@@ -912,6 +901,7 @@ class StreamProcessor(proc_base.BaseProcessor):
 
             if self.think_opened:
                 yield self._sse("</think>\n")
+                self.think_closed_once = True
 
             if self._tool_stream_enabled:
                 for kind, payload in self._flush_tool_stream():
@@ -984,13 +974,11 @@ class CollectProcessor(proc_base.BaseProcessor):
         self,
         model: str,
         token: str = "",
-        show_think: bool = False,
         tools: List[Dict[str, Any]] = None,
         tool_choice: Any = None,
         prompt_tokens: int = 0,
     ):
         super().__init__(model, token)
-        self.show_think = bool(show_think)
         self.filter_tags = get_config("app.filter_tags")
         self.tools = tools
         self.tool_choice = tool_choice
@@ -1034,11 +1022,6 @@ class CollectProcessor(proc_base.BaseProcessor):
         response_id = ""
         fingerprint = ""
         content = ""
-        # 兜底收集非 thinking 且无 messageStepId 的最终内容 token
-        fallback_tokens: list[str] = []
-        # 收集 thinking token（show_think 开启时用于输出思维链）
-        thinking_tokens: list[str] = []
-        content_started = False
         idle_timeout = get_config("chat.stream_timeout")
 
         try:
@@ -1057,21 +1040,6 @@ class CollectProcessor(proc_base.BaseProcessor):
 
                 if (llm := resp.get("llmInfo")) and not fingerprint:
                     fingerprint = llm.get("modelHash", "")
-
-                # 按 thinking 状态分流收集 token
-                is_thinking = bool(resp.get("isThinking"))
-                has_step_id = bool(resp.get("messageStepId"))
-                in_think = is_thinking or has_step_id
-                if tok := resp.get("token"):
-                    if in_think:
-                        # 正式内容已开始后，丢弃中途插入的 Agent 思考（与 StreamProcessor 对齐）
-                        if not content_started and self.show_think:
-                            thinking_tokens.append(tok)
-                    else:
-                        if tok.strip():
-                            content_started = True
-                        # 收集非 thinking 且无 messageStepId 的 token（最终内容兜底）
-                        fallback_tokens.append(tok)
 
                 if mr := resp.get("modelResponse"):
                     response_id = mr.get("responseId", "")
@@ -1171,16 +1139,6 @@ class CollectProcessor(proc_base.BaseProcessor):
             raise
         finally:
             await self.close()
-
-        # modelResponse.message 为空时（多智能体模型），用兜底 token 拼接
-        if not content and fallback_tokens:
-            content = "".join(fallback_tokens)
-
-        # 思维链拼接：将 thinking token 用 <think> 标签包裹后前置到内容（在过滤前拼接，确保 xai 标签被统一过滤）
-        if thinking_tokens and self.show_think:
-            thinking_text = "".join(thinking_tokens).strip()
-            if thinking_text:
-                content = f"<think>\n{thinking_text}\n</think>\n{content}"
 
         content = self._filter_content(content)
 

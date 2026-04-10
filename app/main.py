@@ -28,6 +28,7 @@ from app.platform.logging.logger import logger, setup_logging, reload_logging
 from app.platform.config.snapshot import config as _config
 from app.platform.errors import AppError
 from app.platform.meta import get_project_version
+from app.platform.paths import data_path
 
 
 load_dotenv()
@@ -37,7 +38,7 @@ load_dotenv()
 # Scheduler leader-election via advisory file lock
 # ---------------------------------------------------------------------------
 
-_LOCK_FILE = Path(__file__).resolve().parent.parent / "data" / ".scheduler.lock"
+_LOCK_FILE = data_path(".scheduler.lock")
 _lock_fd: int | None = None
 
 
@@ -79,7 +80,10 @@ def _release_scheduler_lock() -> None:
 # Early logging setup (before config is loaded)
 # ---------------------------------------------------------------------------
 
-setup_logging(level=os.getenv("LOG_LEVEL", "INFO"))
+setup_logging(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    file_logging=os.getenv("LOG_FILE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"},
+)
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +112,16 @@ async def lifespan(app: FastAPI):
 
     repo      = create_repository()
     await repo.initialize()
+
+    # 2a. First-boot migrations (config seed / account migration from SQLite).
+    from app.platform.startup import run_startup_migrations
+    await run_startup_migrations(
+        config_backend=_config._get_backend(),
+        account_repo=repo,
+    )
+    # Reload config in case it was just seeded/migrated into the backend.
+    await _config.load()
+
     directory = await get_account_directory(repo)
 
     # Expose repository on app.state for admin handlers.

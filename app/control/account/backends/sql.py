@@ -5,7 +5,13 @@ only the DDL fragments and upsert syntax differ.
 """
 
 import json
+import os
+import ssl
+from threading import Lock
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
+import asyncio
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
@@ -61,6 +67,339 @@ meta_table = sa.Table(
     sa.Column("value", sa.Text, nullable=False),
 )
 
+_SQL_SSL_MODE_PARAM_KEYS = ("sslmode", "ssl-mode", "ssl")
+_PG_SSL_CERT_PARAM_KEYS = ("sslrootcert", "sslcert", "sslkey")
+_PG_SSL_UNSUPPORTED_PARAM_KEYS = (
+    "sslcrl",
+    "sslpassword",
+    "sslnegotiation",
+    "ssl_min_protocol_version",
+    "ssl_max_protocol_version",
+)
+_PG_SSL_QUERY_PARAM_KEYS = (
+    *_SQL_SSL_MODE_PARAM_KEYS,
+    *_PG_SSL_CERT_PARAM_KEYS,
+    *_PG_SSL_UNSUPPORTED_PARAM_KEYS,
+)
+_MYSQL_SSL_CERT_PARAM_KEYS = ("ssl-ca", "ssl-capath", "ssl-cert", "ssl-key")
+_MYSQL_SSL_OPTIONAL_PARAM_KEYS = ("ssl-check-hostname", "ssl-cipher")
+_MYSQL_SSL_QUERY_PARAM_KEYS = (
+    *_SQL_SSL_MODE_PARAM_KEYS,
+    *_MYSQL_SSL_CERT_PARAM_KEYS,
+    *_MYSQL_SSL_OPTIONAL_PARAM_KEYS,
+)
+_SSL_BOOL_TRUE = {"1", "true", "yes", "on"}
+_SSL_BOOL_FALSE = {"0", "false", "no", "off"}
+
+_PG_SSL_MODE_ALIASES: dict[str, str] = {
+    "disable": "disable",
+    "disabled": "disable",
+    "false": "disable",
+    "0": "disable",
+    "no": "disable",
+    "off": "disable",
+    "prefer": "prefer",
+    "preferred": "prefer",
+    "allow": "allow",
+    "require": "require",
+    "required": "require",
+    "true": "require",
+    "1": "require",
+    "yes": "require",
+    "on": "require",
+    "verify-ca": "verify-ca",
+    "verify_ca": "verify-ca",
+    "verify-full": "verify-full",
+    "verify_full": "verify-full",
+    "verify-identity": "verify-full",
+    "verify_identity": "verify-full",
+}
+
+_MYSQL_SSL_MODE_ALIASES: dict[str, str] = {
+    "disable": "disabled",
+    "disabled": "disabled",
+    "false": "disabled",
+    "0": "disabled",
+    "no": "disabled",
+    "off": "disabled",
+    "prefer": "preferred",
+    "preferred": "preferred",
+    "allow": "preferred",
+    "require": "required",
+    "required": "required",
+    "true": "required",
+    "1": "required",
+    "yes": "required",
+    "on": "required",
+    "verify-ca": "verify_ca",
+    "verify_ca": "verify_ca",
+    "verify-full": "verify_identity",
+    "verify_full": "verify_identity",
+    "verify-identity": "verify_identity",
+    "verify_identity": "verify_identity",
+}
+
+_ENGINE_CACHE_LOCK = Lock()
+_ENGINE_CACHE: dict[tuple[str, str, str], AsyncEngine] = {}
+_ENGINE_KEYS_BY_ID: dict[int, set[tuple[str, str, str]]] = {}
+
+
+def _normalize_sql_url(dialect: str, url: str) -> str:
+    """Rewrite SQL URLs to the async SQLAlchemy dialect form."""
+    if not url or "://" not in url:
+        return url
+    if dialect == "mysql":
+        if url.startswith("mysql://"):
+            return f"mysql+aiomysql://{url[len('mysql://') :]}"
+        if url.startswith("mariadb://"):
+            return f"mysql+aiomysql://{url[len('mariadb://') :]}"
+        if url.startswith("mariadb+aiomysql://"):
+            return f"mysql+aiomysql://{url[len('mariadb+aiomysql://') :]}"
+        return url
+    if url.startswith("postgres://"):
+        return f"postgresql+asyncpg://{url[len('postgres://') :]}"
+    if url.startswith("postgresql://"):
+        return f"postgresql+asyncpg://{url[len('postgresql://') :]}"
+    if url.startswith("pgsql://"):
+        return f"postgresql+asyncpg://{url[len('pgsql://') :]}"
+    return url
+
+
+def _get_env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        return default
+
+
+def _normalize_ssl_mode(dialect: str, raw_mode: str) -> str:
+    if not raw_mode:
+        raise ValueError("SSL mode cannot be empty")
+
+    mode = raw_mode.strip().lower().replace(" ", "")
+    if dialect == "mysql":
+        canonical = _MYSQL_SSL_MODE_ALIASES.get(mode)
+    else:
+        canonical = _PG_SSL_MODE_ALIASES.get(mode)
+    if not canonical:
+        raise ValueError(f"Unsupported SSL mode {raw_mode!r} for SQL dialect {dialect!r}")
+    return canonical
+
+
+def _has_ssl_options(options: dict[str, str], keys: tuple[str, ...]) -> bool:
+    return any(options.get(key) for key in keys)
+
+
+def _parse_ssl_bool(name: str, raw_value: str | None) -> bool | None:
+    if raw_value is None:
+        return None
+
+    value = raw_value.strip().lower()
+    if not value:
+        return None
+    if value in _SSL_BOOL_TRUE:
+        return True
+    if value in _SSL_BOOL_FALSE:
+        return False
+    raise ValueError(f"Unsupported boolean value {raw_value!r} for SQL SSL option {name!r}")
+
+
+def _extract_sql_ssl_options(
+    dialect: str,
+    url: str,
+) -> tuple[str, dict[str, str]]:
+    parsed = urlparse(url)
+    ssl_query_keys = _PG_SSL_QUERY_PARAM_KEYS if dialect == "postgresql" else _MYSQL_SSL_QUERY_PARAM_KEYS
+    ssl_options: dict[str, str] = {}
+    filtered_query_items: list[tuple[str, str]] = []
+    ssl_param_keys = {key.lower() for key in ssl_query_keys}
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        key_lower = key.lower()
+        if key_lower in ssl_param_keys:
+            normalized_value = value.strip()
+            if key_lower not in ssl_options:
+                ssl_options[key_lower] = normalized_value
+            continue
+        filtered_query_items.append((key, value))
+
+    cleaned_url = urlunparse(
+        parsed._replace(query=urlencode(filtered_query_items, doseq=True))
+    )
+    return cleaned_url, ssl_options
+
+
+def _resolve_ssl_mode(dialect: str, ssl_options: dict[str, str]) -> str | None:
+    raw_ssl_mode = next(
+        (ssl_options.get(key) for key in _SQL_SSL_MODE_PARAM_KEYS if ssl_options.get(key)),
+        None,
+    )
+    if raw_ssl_mode:
+        return _normalize_ssl_mode(dialect, raw_ssl_mode)
+
+    if ssl_options:
+        if dialect == "postgresql":
+            raise ValueError("PostgreSQL SSL URL parameters require sslmode to be set explicitly")
+        raise ValueError("MySQL SSL URL parameters require ssl-mode to be set explicitly")
+    return None
+
+
+def _validate_pg_ssl_options(mode: str | None, ssl_options: dict[str, str]) -> None:
+    unsupported = [
+        key for key in _PG_SSL_UNSUPPORTED_PARAM_KEYS
+        if ssl_options.get(key)
+    ]
+    if unsupported:
+        joined = ", ".join(sorted(unsupported))
+        raise ValueError(f"Unsupported PostgreSQL SSL URL parameter(s): {joined}")
+    if mode == "disable" and _has_ssl_options(ssl_options, _PG_SSL_CERT_PARAM_KEYS):
+        raise ValueError("PostgreSQL SSL certificate parameters cannot be used with sslmode=disable")
+    if mode in {"allow", "prefer"} and _has_ssl_options(ssl_options, _PG_SSL_CERT_PARAM_KEYS):
+        raise ValueError("PostgreSQL sslmode=allow/prefer is not supported with certificate URL parameters")
+
+
+def _build_pg_ssl_context(mode: str, ssl_options: dict[str, str]) -> ssl.SSLContext:
+    sslrootcert = ssl_options.get("sslrootcert") or None
+    sslcert = ssl_options.get("sslcert") or None
+    sslkey = ssl_options.get("sslkey") or None
+
+    ctx = ssl.create_default_context(cafile=sslrootcert)
+    if mode == "require":
+        ctx.check_hostname = False
+        if not sslrootcert:
+            ctx.verify_mode = ssl.CERT_NONE
+    elif mode == "verify-ca":
+        ctx.check_hostname = False
+    else:
+        ctx.check_hostname = True
+
+    if sslcert:
+        ctx.load_cert_chain(certfile=sslcert, keyfile=sslkey or None)
+    elif sslkey:
+        raise ValueError("PostgreSQL sslkey requires sslcert")
+    return ctx
+
+
+def _build_mysql_ssl_context(mode: str, ssl_options: dict[str, str]) -> ssl.SSLContext | None:
+    if mode == "disabled":
+        if _has_ssl_options(ssl_options, _MYSQL_SSL_CERT_PARAM_KEYS):
+            raise ValueError("MySQL SSL certificate parameters cannot be used with ssl-mode=disabled")
+        return None
+    if mode == "preferred":
+        raise ValueError("MySQL ssl-mode=allow/prefer is not supported by aiomysql")
+
+    ssl_ca = ssl_options.get("ssl-ca") or None
+    ssl_capath = ssl_options.get("ssl-capath") or None
+    ssl_cert = ssl_options.get("ssl-cert") or None
+    ssl_key = ssl_options.get("ssl-key") or None
+    ssl_check_hostname = _parse_ssl_bool("ssl-check-hostname", ssl_options.get("ssl-check-hostname"))
+    ssl_cipher = ssl_options.get("ssl-cipher") or None
+
+    ctx = ssl.create_default_context(cafile=ssl_ca, capath=ssl_capath)
+    if mode in ("preferred", "required"):
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    elif mode == "verify_ca":
+        ctx.check_hostname = False
+    else:
+        ctx.check_hostname = True
+
+    if ssl_check_hostname is not None:
+        if mode == "required" and ssl_check_hostname:
+            raise ValueError("MySQL ssl-check-hostname=true requires ssl-mode=verify_identity")
+        ctx.check_hostname = ssl_check_hostname
+    if ssl_cipher:
+        ctx.set_ciphers(ssl_cipher)
+    if ssl_cert:
+        ctx.load_cert_chain(certfile=ssl_cert, keyfile=ssl_key or None)
+    elif ssl_key:
+        raise ValueError("MySQL ssl-key requires ssl-cert")
+    return ctx
+
+
+def _build_sql_connect_args(
+    dialect: str,
+    ssl_options: dict[str, str],
+) -> dict[str, Any] | None:
+    mode = _resolve_ssl_mode(dialect, ssl_options)
+    if not mode:
+        return None
+
+    if dialect == "mysql":
+        ctx = _build_mysql_ssl_context(mode, ssl_options)
+        return {"ssl": ctx} if ctx is not None else None
+
+    _validate_pg_ssl_options(mode, ssl_options)
+    if mode == "disable":
+        return None
+    # asyncpg does not accept ssl= as a plain string (e.g. "require").
+    # Always build a proper ssl.SSLContext so the driver can use it directly.
+    return {"ssl": _build_pg_ssl_context(mode, ssl_options)}
+
+
+def _prepare_sql_url_and_connect_args(
+    dialect: str,
+    url: str,
+) -> tuple[str, dict[str, Any] | None]:
+    """Strip SSL query params from the URL and translate them to connect_args."""
+    normalized_url = _normalize_sql_url(dialect, url)
+    if "://" not in normalized_url:
+        return normalized_url, None
+
+    cleaned_url, ssl_options = _extract_sql_ssl_options(dialect, normalized_url)
+    return cleaned_url, _build_sql_connect_args(dialect, ssl_options)
+
+
+def _is_serverless() -> bool:
+    """Detect common serverless environments (Vercel, AWS Lambda, etc.)."""
+    return bool(
+        os.getenv("VERCEL")
+        or os.getenv("AWS_LAMBDA_FUNCTION_NAME")
+        or os.getenv("FUNCTIONS_WORKER_RUNTIME")  # Azure Functions
+    )
+
+
+def _sql_engine_kwargs(connect_args: dict[str, Any] | None) -> dict[str, Any]:
+    # In serverless environments each function instance is short-lived and may
+    # run concurrently.  Keep pools small to avoid exhausting DB connections.
+    serverless = _is_serverless()
+    kwargs: dict[str, Any] = {
+        "pool_size":    _get_env_int("ACCOUNT_SQL_POOL_SIZE",    1 if serverless else 5,  minimum=1),
+        "max_overflow": _get_env_int("ACCOUNT_SQL_MAX_OVERFLOW", 2 if serverless else 10, minimum=0),
+        "pool_timeout": _get_env_int("ACCOUNT_SQL_POOL_TIMEOUT", 30, minimum=1),
+        "pool_recycle": _get_env_int("ACCOUNT_SQL_POOL_RECYCLE", 1800, minimum=0),
+        "pool_pre_ping": True,
+        "pool_use_lifo": True,
+    }
+    if connect_args:
+        kwargs["connect_args"] = connect_args
+    return kwargs
+
+
+def _get_or_create_engine(
+    cache_key: tuple[str, str, str],
+    normalized_url: str,
+    connect_args: dict[str, Any] | None,
+) -> AsyncEngine:
+    with _ENGINE_CACHE_LOCK:
+        engine = _ENGINE_CACHE.get(cache_key)
+        if engine is not None:
+            return engine
+
+        engine = create_async_engine(normalized_url, **_sql_engine_kwargs(connect_args))
+        _ENGINE_CACHE[cache_key] = engine
+        _ENGINE_KEYS_BY_ID.setdefault(id(engine), set()).add(cache_key)
+        return engine
+
+
+def _evict_cached_engine(engine: AsyncEngine) -> None:
+    with _ENGINE_CACHE_LOCK:
+        for key in _ENGINE_KEYS_BY_ID.pop(id(engine), set()):
+            if _ENGINE_CACHE.get(key) is engine:
+                _ENGINE_CACHE.pop(key, None)
+
 
 def _row_to_record(row: Any) -> AccountRecord:
     d = dict(row._mapping)
@@ -80,10 +419,19 @@ def _row_to_record(row: Any) -> AccountRecord:
 class SqlAccountRepository:
     """Async SQLAlchemy-based repository for MySQL / PostgreSQL."""
 
-    def __init__(self, engine: AsyncEngine, *, dialect: str = "mysql") -> None:
-        self._engine  = engine
-        self._dialect = dialect   # "mysql" | "postgresql"
-        self._session = async_sessionmaker(engine, expire_on_commit=False)
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        *,
+        dialect: str = "mysql",
+        dispose_engine: bool = True,
+    ) -> None:
+        self._engine       = engine
+        self._dialect      = dialect   # "mysql" | "postgresql"
+        self._session      = async_sessionmaker(engine, expire_on_commit=False)
+        self._dispose_engine = dispose_engine
+        self._initialized  = False
+        self._init_lock    = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Revision helpers (run inside a transaction)
@@ -131,7 +479,23 @@ class SqlAccountRepository:
     # Public API
     # ------------------------------------------------------------------
 
-    async def initialize(self) -> None:
+    async def _ensure_initialized(self) -> None:
+        """Idempotent: create tables + seed revision row if not already done.
+
+        Safe to call on every request — short-circuits after first success so
+        repeated calls cost only an asyncio lock check.  This allows the
+        repository to self-initialise even when the ASGI lifespan is not
+        executed (e.g. Vercel serverless cold-starts).
+        """
+        if self._initialized:
+            return
+        async with self._init_lock:
+            if self._initialized:
+                return
+            await self._do_initialize()
+            self._initialized = True
+
+    async def _do_initialize(self) -> None:
         async with self._engine.begin() as conn:
             await conn.run_sync(metadata.create_all)
             # Seed revision row.
@@ -150,11 +514,16 @@ class SqlAccountRepository:
                     .on_duplicate_key_update(value="0")
                 )
 
+    async def initialize(self) -> None:
+        await self._ensure_initialized()
+
     async def get_revision(self) -> int:
+        await self._ensure_initialized()
         async with self._engine.connect() as conn:
             return await self._get_revision(conn)
 
     async def runtime_snapshot(self) -> RuntimeSnapshot:
+        await self._ensure_initialized()
         async with self._engine.connect() as conn:
             rev = await self._get_revision(conn)
             rows = (await conn.execute(
@@ -168,6 +537,7 @@ class SqlAccountRepository:
         *,
         limit: int = 5000,
     ) -> AccountChangeSet:
+        await self._ensure_initialized()
         async with self._engine.connect() as conn:
             rev = await self._get_revision(conn)
             rows = (await conn.execute(
@@ -197,6 +567,7 @@ class SqlAccountRepository:
     ) -> AccountMutationResult:
         if not items:
             return AccountMutationResult()
+        await self._ensure_initialized()
         async with self._engine.begin() as conn:
             rev = await self._bump_revision(conn)
             ts  = now_ms()
@@ -236,6 +607,7 @@ class SqlAccountRepository:
     ) -> AccountMutationResult:
         if not patches:
             return AccountMutationResult()
+        await self._ensure_initialized()
         async with self._engine.begin() as conn:
             rev = await self._bump_revision(conn)
             ts  = now_ms()
@@ -247,7 +619,6 @@ class SqlAccountRepository:
                 if row is None:
                     continue
                 record = _row_to_record(row)
-                qs = record.quota_set()
 
                 updates: dict[str, Any] = {"updated_at": ts, "revision": rev}
                 if patch.pool is not None:
@@ -321,6 +692,7 @@ class SqlAccountRepository:
     ) -> AccountMutationResult:
         if not tokens:
             return AccountMutationResult()
+        await self._ensure_initialized()
         async with self._engine.begin() as conn:
             rev = await self._bump_revision(conn)
             ts  = now_ms()
@@ -340,6 +712,7 @@ class SqlAccountRepository:
     ) -> list[AccountRecord]:
         if not tokens:
             return []
+        await self._ensure_initialized()
         async with self._engine.connect() as conn:
             rows = (await conn.execute(
                 sa.select(accounts_table).where(accounts_table.c.token.in_(tokens))
@@ -350,6 +723,7 @@ class SqlAccountRepository:
         self,
         query: ListAccountsQuery,
     ) -> AccountPage:
+        await self._ensure_initialized()
         async with self._engine.connect() as conn:
             stmt = sa.select(accounts_table)
             if not query.include_deleted:
@@ -387,6 +761,7 @@ class SqlAccountRepository:
         self,
         command: BulkReplacePoolCommand,
     ) -> AccountMutationResult:
+        await self._ensure_initialized()
         async with self._engine.begin() as conn:
             rev = await self._bump_revision(conn)
             ts  = now_ms()
@@ -409,17 +784,27 @@ class SqlAccountRepository:
 
     async def close(self) -> None:
         """Dispose the SQLAlchemy connection pool."""
-        await self._engine.dispose()
+        if self._dispose_engine:
+            _evict_cached_engine(self._engine)
+            await self._engine.dispose()
+
+
+def _engine_cache_key(dialect: str, normalized_url: str, connect_args: dict[str, Any] | None) -> tuple[str, str, str]:
+    """Build a stable cache key from the normalized URL and connect args."""
+    args_key = str(sorted(connect_args.items(), key=lambda kv: kv[0])) if connect_args else ""
+    return (dialect, normalized_url, args_key)
 
 
 def create_mysql_engine(url: str) -> AsyncEngine:
     """Create an async SQLAlchemy engine for MySQL."""
-    return create_async_engine(url, pool_size=10, max_overflow=20, pool_pre_ping=True)
+    normalized_url, connect_args = _prepare_sql_url_and_connect_args("mysql", (url or "").strip())
+    return _get_or_create_engine(_engine_cache_key("mysql", normalized_url, connect_args), normalized_url, connect_args)
 
 
 def create_pgsql_engine(url: str) -> AsyncEngine:
     """Create an async SQLAlchemy engine for PostgreSQL."""
-    return create_async_engine(url, pool_size=10, max_overflow=20, pool_pre_ping=True)
+    normalized_url, connect_args = _prepare_sql_url_and_connect_args("postgresql", (url or "").strip())
+    return _get_or_create_engine(_engine_cache_key("postgresql", normalized_url, connect_args), normalized_url, connect_args)
 
 
 __all__ = ["SqlAccountRepository", "create_mysql_engine", "create_pgsql_engine"]

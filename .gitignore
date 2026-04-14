@@ -44,7 +44,10 @@ logs/
 
 # Data
 data/
-app/data/
+
+# Lint / Format Cache
+.ruff_cache/
+.mypy_cache/
 
 # Testing
 .pytest_cache/
@@ -53,7 +56,13 @@ htmlcov/
 
 # Project specific
 .ace-tool/
+temp/
+tmp/
 
-# Claude Code
+# Claude Code（保留 settings.json 和 rules/ 可提交）
 .claude/settings.local.json
 .claude/index.json
+.claude/session-*
+
+# Playwright MCP
+.playwright-mcp/

@@ -22,7 +22,7 @@ docker compose up -d
 ```
 
 - **测试**：`tests/` 目录下为手动集成测试脚本（无 pytest），单独运行：`python tests/test_tool_calls_live.py`
-- **管理面板**：`http://localhost:8000/admin`（默认密码 `grok2api`，对应配置项 `app.app_key`）
+- **管理面板**：`http://localhost:8000/admin` （默认密码 `grok2api`，对应配置项 `app.app_key`）
 
 ## 架构
 
@@ -63,6 +63,16 @@ docker compose up -d
 - **代理池 Failover**：支持 direct / single_proxy / proxy_pool 三种出口模式，sticky 选择 + 故障轮换
 - **SSE 安全包装**：`_safe_sse_stream()` 确保流式错误以 SSE event 返回而非断连
 - **模型注册表**：`app/control/model/registry.py` 的 `MODELS` 元组是所有模型定义的唯一权威源（含 Capability、Tier、ModeId 元数据）
+- **搜索信源透传**（详见 `docs/search-sources.md`）：
+  - **内联引用**：`StreamAdapter._render_replace()` 将 `<grok:render>` 标签转为 `[[N]](url)` 内联链接（5-15 条高质量引用）
+  - **全量信源**：`StreamAdapter` 逐帧采集 `webSearchResults` + `xSearchResults`（44-400+ 条），去重后可追加 `## Sources` 段落（`features.show_search_sources` 控制）
+  - 两类信源独立：内联引用适合 `annotations` 字段（有文本位置），全量信源适合 `## Sources` 或自定义字段（无文本位置）
+  - 多轮对话自动剥离前轮 `## Sources`，防止上下文膨胀
+- **多 Agent 思维链**：详细模式（默认）透传原始多 Agent 思考流含身份标识和工具调用；精简模式（`features.thinking_summary`）输出结构化摘要
+- **认证双模式**：同时支持 `Authorization: Bearer` 和 `X-API-Key` header（兼容 Anthropic SDK）
+- **SQL 存储增强**：SSL 选项（PostgreSQL/MySQL）、连接池配置（pool_size 等）、serverless 支持、启动时共享 engine
+- **Proxy Clearance 调度器**：定时刷新 + 预热，代理故障反馈抽象（`_proxy_feedback.py`）
+- **日志可配置**：`[logging]` section 支持文件等级和轮转天数，管理面板可热更新
 
 ### 模型体系
 
@@ -72,13 +82,15 @@ docker compose up -d
 - **Tier**：`BASIC`（免费池）/ `SUPER`（付费池）/ `HEAVY`（重型池）
 - **Capability**：`CHAT` / `IMAGE` / `IMAGE_EDIT` / `VIDEO` / `VOICE` / `ASSET`（位掩码组合）
 
-当前注册 15 个模型：10 Chat + 3 Image + 1 Image Edit + 1 Video。
+当前注册 19 个模型：14 Chat（含 4 个 prefer-best 别名） + 3 Image + 1 Image Edit + 1 Video。
+
+- **prefer_best 模型**：`grok-4.20-{fast,auto,expert,heavy}` 无版本后缀，反转池选择顺序（heavy → super → basic），优先使用最高 Tier 账号
 
 ## 配置系统
 
-- **默认配置**：`config.defaults.toml`（15 个 section）
+- **默认配置**：`config.defaults.toml`（14 个 section）
 - **运行时覆盖**：`data/config.toml`（深度合并覆盖默认值）
-- **环境变量**：`LOG_LEVEL`、`LOG_FILE_ENABLED`、`DATA_DIR`、`SERVER_PORT`、`SERVER_WORKERS`、`SERVER_STORAGE_TYPE`、`SERVER_STORAGE_URL`、`ACCOUNT_SYNC_INTERVAL`、`ACCOUNT_SYNC_ACTIVE_INTERVAL`
+- **环境变量**：`LOG_LEVEL`、`LOG_FILE_ENABLED`、`DATA_DIR`、`SERVER_PORT`、`SERVER_WORKERS`、`ACCOUNT_STORAGE`（local/redis/mysql/postgresql）、`ACCOUNT_REDIS_URL`、`ACCOUNT_MYSQL_URL`、`ACCOUNT_POSTGRESQL_URL`、`ACCOUNT_SYNC_INTERVAL`、`ACCOUNT_SYNC_ACTIVE_INTERVAL`、`ACCOUNT_SQL_POOL_SIZE`、`ACCOUNT_SQL_MAX_OVERFLOW`、`ACCOUNT_SQL_POOL_TIMEOUT`、`ACCOUNT_SQL_POOL_RECYCLE`
 - **存储后端**：local（TOML/JSON 文件）、Redis、MySQL（`mysql+aiomysql://`）、PostgreSQL（`postgresql+asyncpg://`）
 - **自动迁移**：首次启动自动执行 config seed 和旧版账号数据迁移
 
@@ -87,7 +99,8 @@ docker compose up -d
 | Section | 说明 |
 |:--|:--|
 | `[app]` | 管理密码、API Key、WebUI 开关 |
-| `[features]` | 临时对话、记忆、流式、思考输出、NSFW、图片/视频返回格式 |
+| `[logging]` | 文件日志等级、日志轮转保留天数 |
+| `[features]` | 临时对话、记忆、流式、思考输出、搜索信源透传、动态 Statsig 指纹、NSFW、自定义指令、图片/视频返回格式 |
 | `[proxy.egress]` | 出口模式（direct/single_proxy/proxy_pool）、资源代理 |
 | `[proxy.clearance]` | Cloudflare 绕过（none/manual/flaresolverr） |
 | `[retry]` | Session 重建状态码、换号重试策略 |
@@ -115,3 +128,10 @@ docker compose up -d
 - 代码中使用中文注释；日志/调试输出使用英文
 - 错误格式对齐 OpenAI：`{"error": {"message": ..., "type": ..., "code": ...}}`
 - 并发控制：`asyncio.Semaphore`（限流）+ `asyncio.Lock`（互斥）
+
+## 文档
+
+| 路径 | 说明 |
+|:--|:--|
+| `docs/search-sources.md` | 搜索信源透传：两类信源区分、采集/剥离机制、annotations 设计、new-api 透传验证 |
+| `docs/README.en.md` | 英文 README |

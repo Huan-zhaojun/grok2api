@@ -65,8 +65,9 @@ docker compose up -d
 - **模型注册表**：`app/control/model/registry.py` 的 `MODELS` 元组是所有模型定义的唯一权威源（含 Capability、Tier、ModeId 元数据）
 - **搜索信源透传**（详见 `docs/search-sources.md`）：
   - **内联引用**：`StreamAdapter._render_replace()` 将 `<grok:render>` 标签转为 `[[N]](url)` 内联链接（5-15 条高质量引用）
-  - **全量信源**：`StreamAdapter` 逐帧采集 `webSearchResults` + `xSearchResults`（44-400+ 条），去重后可追加 `## Sources` 段落（`features.show_search_sources` 控制）
-  - 两类信源独立：内联引用适合 `annotations` 字段（有文本位置），全量信源适合 `## Sources` 或自定义字段（无文本位置）
+  - **annotations**：`_render_replace()` 生成引用时同步构建 `url_citation` annotations（URL、title、文本位置），通过 `FrameEvent("annotation")` 传递到三个 API 端点。Responses API 含 `annotation.added` 流式事件；Chat Completions 在 final chunk 的 `delta.annotations`（嵌套格式）；Anthropic 作为自定义扩展。CherryStudio 仅从 Responses API 渲染引用卡片
+  - **全量信源**：`StreamAdapter` 逐帧采集 `webSearchResults` + `xSearchResults`（44-400+ 条），去重后始终以 `search_sources` 结构化字段输出（`[{url, title, type}]`）；`features.show_search_sources` 控制是否同时追加 `## Sources` 正文
+  - 两类信源独立：内联引用通过 `annotations` 字段输出（有文本位置），全量信源通过 `search_sources` 字段输出（无文本位置）
   - 多轮对话自动剥离前轮 `## Sources`，防止上下文膨胀
 - **多 Agent 思维链**：详细模式（默认）透传原始多 Agent 思考流含身份标识和工具调用；精简模式（`features.thinking_summary`）输出结构化摘要
 - **认证双模式**：同时支持 `Authorization: Bearer` 和 `X-API-Key` header（兼容 Anthropic SDK）

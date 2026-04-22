@@ -11,25 +11,30 @@ from app.platform.logging.logger import logger
 from app.platform.config.snapshot import get_config
 from app.platform.errors import RateLimitError, UpstreamError, ValidationError
 from app.platform.runtime.clock import now_s
+from app.platform.storage import save_local_image
 from app.platform.tokens import (
     estimate_prompt_tokens,
     estimate_tokens,
     estimate_tool_call_tokens,
 )
-from app.platform.storage import image_files_dir
 from app.control.account.runtime import get_refresh_service
 from app.control.account.invalid_credentials import feedback_kind_for_error
 from app.control.model.registry import resolve as resolve_model
 from app.control.model.enums import ModeId
 from app.control.account.enums import FeedbackKind
+from app.dataplane.account.selector import current_strategy
 from app.dataplane.proxy.adapters.headers import build_http_headers
 from app.dataplane.proxy import get_proxy_runtime
-from app.dataplane.proxy.adapters.session import ResettableSession, build_session_kwargs
+from app.dataplane.proxy.adapters.session import (
+    ResettableSession,
+    build_session_kwargs,
+)
 from app.dataplane.reverse.protocol.xai_chat import (
     build_chat_payload,
     classify_line,
     StreamAdapter,
 )
+from app.dataplane.reverse.protocol.xai_usage import is_invalid_credentials_error
 from app.dataplane.reverse.runtime.endpoint_table import CHAT
 from app.dataplane.reverse.transport.asset_upload import upload_from_input
 from app.dataplane.reverse.protocol.tool_prompt import (
@@ -50,14 +55,27 @@ from ._format import (
     build_usage,
 )
 from ._tool_sieve import ToolSieve
+from app.products._account_selection import reserve_account, selection_max_retries
 
 
 def _to_chat_annotations(anns: list[dict]) -> list[dict]:
     """扁平 annotations → Chat Completions 嵌套格式（内层无 type）"""
-    return [{"type": "url_citation", "url_citation": {
-        "url": a["url"], "title": a["title"],
-        "start_index": a["start_index"], "end_index": a["end_index"],
-    }} for a in anns] if anns else []
+    return (
+        [
+            {
+                "type": "url_citation",
+                "url_citation": {
+                    "url": a["url"],
+                    "title": a["title"],
+                    "start_index": a["start_index"],
+                    "end_index": a["end_index"],
+                },
+            }
+            for a in anns
+        ]
+        if anns
+        else []
+    )
 
 
 def _log_task_exception(task: "asyncio.Task") -> None:
@@ -67,9 +85,30 @@ def _log_task_exception(task: "asyncio.Task") -> None:
         logger.warning("background task failed: task={} error={}", task.get_name(), exc)
 
 
+def _upstream_body_excerpt(exc: UpstreamError, *, limit: int = 240) -> str:
+    details = getattr(exc, "details", {})
+    if not isinstance(details, dict):
+        return "-"
+    body = str(details.get("body", "") or "").replace("\n", "\\n")
+    return body[:limit] or "-"
+
+
+def _transport_upstream_error(exc: BaseException, *, context: str) -> UpstreamError:
+    if isinstance(exc, UpstreamError):
+        return exc
+    body = str(exc).replace("\n", "\\n")[:400]
+    return UpstreamError(
+        f"{context}: {exc}",
+        status=502,
+        body=body,
+    )
+
+
 async def _quota_sync(token: str, mode_id: int) -> None:
     """Fire-and-forget: fetch real quota after a successful call."""
     try:
+        if current_strategy() != "quota":
+            return
         svc = get_refresh_service()
         if svc:
             await svc.refresh_call_async(token, mode_id)
@@ -85,11 +124,29 @@ async def _quota_sync(token: str, mode_id: int) -> None:
 async def _fail_sync(
     token: str, mode_id: int, exc: BaseException | None = None
 ) -> None:
-    """Fire-and-forget: persist failure counter after a failed call."""
+    """Fire-and-forget: persist failure metadata after a failed call.
+
+    In random mode this helper must not trigger upstream quota probes. It still
+    records failures so 401 invalidation and local failure accounting continue
+    to work unchanged.
+    """
     try:
         svc = get_refresh_service()
         if svc:
             await svc.record_failure_async(token, mode_id, exc)
+            if (
+                current_strategy() == "quota"
+                and getattr(exc, "status", None) == 429
+            ):
+                result = await svc.refresh_on_demand()
+                logger.info(
+                    "account on-demand refresh triggered: token={}... mode_id={} refreshed={} failed={} rate_limited={}",
+                    token[:10],
+                    mode_id,
+                    result.refreshed,
+                    result.failed,
+                    result.rate_limited,
+                )
     except Exception as e:
         logger.warning(
             "chat fail sync error: token={}... mode_id={} error={}",
@@ -100,13 +157,33 @@ async def _fail_sync(
 
 
 def _parse_retry_codes(s: str) -> frozenset[int]:
-    """Parse a comma-separated list of HTTP status codes into a frozenset."""
+    """Parse retry status-code config from either a CSV string or a list."""
     result: set[int] = set()
-    for part in s.split(","):
-        part = part.strip()
-        if part.isdigit():
-            result.add(int(part))
+    parts: list[object]
+    if isinstance(s, str):
+        parts = [part.strip() for part in s.split(",")]
+    elif isinstance(s, (list, tuple, set)):
+        parts = list(s)
+    else:
+        return frozenset()
+    for part in parts:
+        text = str(part).strip()
+        if text.isdigit():
+            result.add(int(text))
     return frozenset(result)
+
+
+def _configured_retry_codes(cfg) -> frozenset[int]:
+    """Read retry codes from current config, including legacy array keys."""
+    raw = cfg.get("retry.on_codes")
+    if raw is None:
+        raw = cfg.get("retry.retry_status_codes", "429,401,503")
+    return _parse_retry_codes(raw)
+
+
+def _should_retry_upstream(exc: UpstreamError, retry_codes: frozenset[int]) -> bool:
+    """Return whether this upstream error should switch to another token."""
+    return exc.status in retry_codes or is_invalid_credentials_error(exc)
 
 
 def _feedback_kind(exc: BaseException) -> "FeedbackKind":
@@ -133,12 +210,7 @@ async def _download_image_bytes(token: str, url: str) -> tuple[bytes, str]:
 
 def _save_image(raw: bytes, mime: str, image_id: str) -> str:
     """Save raw bytes to ``${DATA_DIR}/files/images`` and return the file ID."""
-    img_dir = image_files_dir()
-    ext = ".png" if "png" in mime else ".jpg"
-    path = img_dir / f"{image_id}{ext}"
-    if not path.exists():
-        path.write_bytes(raw)
-    return image_id
+    return save_local_image(raw, mime, image_id)
 
 
 async def _resolve_image(token: str, url: str, image_id: str) -> str:
@@ -174,7 +246,7 @@ async def _resolve_image(token: str, url: str, image_id: str) -> str:
         return f"![image](data:{mime};base64,{b64})"
 
     # local_url / local_md: save to disk and return local path
-    file_id = _save_image(raw, mime, image_id)
+    file_id = await asyncio.to_thread(_save_image, raw, mime, image_id)
     app_url = cfg.get_str("app.app_url", "").rstrip("/")
     local_url = (
         f"{app_url}/v1/files/image?id={file_id}"
@@ -197,10 +269,22 @@ def _normalize_image_format(value: str | None) -> str:
     return fmt
 
 
+_THINK_TAG_RE = re.compile(r"<think>[\s\S]*?</think>")
+_INLINE_BASE64_IMG_RE = re.compile(r"!\[image\]\(data:[^)]*?base64,[^)]*?\)")
 # 精确匹配 grok2api 注入的 Sources 段落（含标记行），用于多轮对话剥离
 _SOURCES_STRIP_RE = re.compile(
     r"(?:^|\r?\n\r?\n)## Sources\r?\n\[grok2api-sources\]: #\r?\n[\s\S]*$"
 )
+
+
+def _strip_generated_artifacts(text: str, *, strip_sources: bool = False) -> str:
+    """Remove generated assistant artifacts before reusing conversation history."""
+    if not text or not isinstance(text, str):
+        return text
+    if strip_sources:
+        text = _SOURCES_STRIP_RE.sub("", text)
+    text = _THINK_TAG_RE.sub("", text).strip()
+    return _INLINE_BASE64_IMG_RE.sub("[图片]", text)
 
 
 def _extract_message(messages: list[dict]) -> tuple[str, list[str]]:
@@ -237,23 +321,24 @@ def _extract_message(messages: list[dict]) -> tuple[str, list[str]]:
 
         # ── 剥离前轮 assistant 消息中 grok2api 注入的 Sources 段落 ────────────
         if role == "assistant" and isinstance(content, str):
-            content = _SOURCES_STRIP_RE.sub("", content)
+            content = _strip_generated_artifacts(content, strip_sources=True)
 
         # ── normal content handling ───────────────────────────────────────────
         if isinstance(content, str):
-            if content.strip():
-                parts.append(f"[{role}]: {content.strip()}")
+            cleaned = _strip_generated_artifacts(content.strip())
+            if cleaned:
+                parts.append(f"[{role}]: {cleaned}")
         elif isinstance(content, list):
             for block in content:
                 if not isinstance(block, dict):
                     continue
                 btype = block.get("type")
                 if btype == "text":
-                    text = (block.get("text") or "")
-                    # 块列表中的 assistant text 也需剥离 Sources（先 regex 再 strip，与 str 路径对齐）
-                    if role == "assistant":
-                        text = _SOURCES_STRIP_RE.sub("", text)
-                    text = text.strip()
+                    text = block.get("text") or ""
+                    text = _strip_generated_artifacts(
+                        text.strip(),
+                        strip_sources=(role == "assistant"),
+                    )
                     if text:
                         parts.append(f"[{role}]: {text}")
                 elif btype == "image_url":
@@ -317,13 +402,18 @@ async def _stream_chat(
     session_kwargs = build_session_kwargs(lease=lease)
 
     async with ResettableSession(**session_kwargs) as session:
-        response = await session.post(
-            CHAT,
-            headers=headers,
-            data=payload_bytes,
-            timeout=timeout_s,
-            stream=True,
-        )
+        try:
+            response = await session.post(
+                CHAT,
+                headers=headers,
+                data=payload_bytes,
+                timeout=timeout_s,
+                stream=True,
+            )
+        except Exception as exc:
+            raise _transport_upstream_error(
+                exc, context="Chat transport failed"
+            ) from exc
 
         if response.status_code != 200:
             try:
@@ -336,8 +426,13 @@ async def _stream_chat(
                 body=body,
             )
 
-        async for line in response.aiter_lines():
-            yield line
+        try:
+            async for line in response.aiter_lines():
+                yield line
+        except Exception as exc:
+            raise _transport_upstream_error(
+                exc, context="Chat stream read failed"
+            ) from exc
 
 
 async def completions(
@@ -345,7 +440,7 @@ async def completions(
     model: str,
     messages: list[dict],
     stream: bool | None = None,
-    thinking: bool | None = None,
+    emit_think: bool | None = None,
     tools: list[dict] | None = None,
     tool_choice: Any = None,
     temperature: float = 0.8,
@@ -360,11 +455,9 @@ async def completions(
     """
     cfg = get_config()
     spec = resolve_model(model)
-    mode_id = int(spec.mode_id)  # cast once, reuse everywhere
     is_stream = stream if stream is not None else cfg.get_bool("features.stream", True)
-    emit_think = (
-        thinking if thinking is not None else cfg.get_bool("features.thinking", True)
-    )
+    if emit_think is None:
+        emit_think = cfg.get_bool("features.thinking", True)
 
     logger.info(
         "chat request accepted: model={} stream={} message_count={}",
@@ -383,8 +476,8 @@ async def completions(
         raise RateLimitError("Account directory not initialised")
     directory = _acct_dir
 
-    max_retries = cfg.get_int("retry.max_retries", 1)
-    retry_codes = _parse_retry_codes(cfg.get_str("retry.on_codes", "429,503"))
+    max_retries = selection_max_retries()
+    retry_codes = _configured_retry_codes(cfg)
     response_id = make_response_id()
     timeout_s = cfg.get_float("chat.timeout", 120.0)
 
@@ -402,9 +495,9 @@ async def completions(
         async def _run_stream() -> AsyncGenerator[str, None]:
             excluded: list[str] = []
             for attempt in range(max_retries + 1):
-                acct = await directory.reserve(
-                    pool_candidates=spec.pool_candidates(),
-                    mode_id=mode_id,
+                acct, selected_mode_id = await reserve_account(
+                    directory,
+                    spec,
                     now_s_override=now_s(),
                     exclude_tokens=excluded or None,
                 )
@@ -425,7 +518,7 @@ async def completions(
                         tool_calls_emitted = False
                         async for line in _stream_chat(
                             token=token,
-                            mode_id=spec.mode_id,
+                            mode_id=ModeId(selected_mode_id),
                             message=message,
                             files=files,
                             tool_overrides=tool_overrides,
@@ -544,7 +637,10 @@ async def completions(
 
                             chat_anns = _to_chat_annotations(collected_annotations)
                             final = make_stream_chunk(
-                                response_id, model, "", is_final=True,
+                                response_id,
+                                model,
+                                "",
+                                is_final=True,
                                 annotations=chat_anns or None,
                             )
                             # 注入结构化搜索信源到 chunk 根对象（避免 delta strict schema 拒绝）
@@ -564,7 +660,10 @@ async def completions(
 
                     except UpstreamError as exc:
                         fail_exc = exc
-                        if exc.status in retry_codes and attempt < max_retries:
+                        if (
+                            _should_retry_upstream(exc, retry_codes)
+                            and attempt < max_retries
+                        ):
                             _retry = True
                             logger.warning(
                                 "chat stream retry scheduled: attempt={}/{} status={} token={}...",
@@ -574,6 +673,14 @@ async def completions(
                                 token[:8],
                             )
                         else:
+                            logger.warning(
+                                "chat stream upstream failed: attempt={}/{} model={} status={} body={}",
+                                attempt + 1,
+                                max_retries + 1,
+                                model,
+                                exc.status,
+                                _upstream_body_excerpt(exc),
+                            )
                             raise
 
                 finally:
@@ -585,14 +692,16 @@ async def completions(
                         if fail_exc
                         else FeedbackKind.SERVER_ERROR
                     )
-                    await directory.feedback(token, kind, mode_id, now_s_val=now_s())
+                    await directory.feedback(
+                        token, kind, selected_mode_id, now_s_val=now_s()
+                    )
                     if success:
                         asyncio.create_task(
-                            _quota_sync(token, mode_id)
+                            _quota_sync(token, selected_mode_id)
                         ).add_done_callback(_log_task_exception)
                     else:
                         asyncio.create_task(
-                            _fail_sync(token, mode_id, fail_exc)
+                            _fail_sync(token, selected_mode_id, fail_exc)
                         ).add_done_callback(_log_task_exception)
 
                 if success or not _retry:
@@ -606,9 +715,9 @@ async def completions(
     token = ""
     adapter = StreamAdapter()
     for attempt in range(max_retries + 1):
-        acct = await directory.reserve(
-            pool_candidates=spec.pool_candidates(),
-            mode_id=mode_id,
+        acct, selected_mode_id = await reserve_account(
+            directory,
+            spec,
             now_s_override=now_s(),
             exclude_tokens=excluded or None,
         )
@@ -625,7 +734,7 @@ async def completions(
             try:
                 async for line in _stream_chat(
                     token=token,
-                    mode_id=spec.mode_id,
+                    mode_id=ModeId(selected_mode_id),
                     message=message,
                     files=files,
                     tool_overrides=tool_overrides,
@@ -648,7 +757,7 @@ async def completions(
 
             except UpstreamError as exc:
                 fail_exc = exc
-                if exc.status in retry_codes and attempt < max_retries:
+                if _should_retry_upstream(exc, retry_codes) and attempt < max_retries:
                     _retry = True
                     logger.warning(
                         "chat retry scheduled: attempt={}/{} status={} token={}...",
@@ -658,6 +767,14 @@ async def completions(
                         token[:8],
                     )
                 else:
+                    logger.warning(
+                        "chat upstream failed: attempt={}/{} model={} status={} body={}",
+                        attempt + 1,
+                        max_retries + 1,
+                        model,
+                        exc.status,
+                        _upstream_body_excerpt(exc),
+                    )
                     raise
 
         finally:
@@ -669,14 +786,14 @@ async def completions(
                 if fail_exc
                 else FeedbackKind.SERVER_ERROR
             )
-            await directory.feedback(token, kind, mode_id, now_s_val=now_s())
+            await directory.feedback(token, kind, selected_mode_id, now_s_val=now_s())
             if success:
-                asyncio.create_task(_quota_sync(token, mode_id)).add_done_callback(
-                    _log_task_exception
-                )
+                asyncio.create_task(
+                    _quota_sync(token, selected_mode_id)
+                ).add_done_callback(_log_task_exception)
             else:
                 asyncio.create_task(
-                    _fail_sync(token, mode_id, fail_exc)
+                    _fail_sync(token, selected_mode_id, fail_exc)
                 ).add_done_callback(_log_task_exception)
 
         if success or not _retry:
@@ -754,4 +871,8 @@ async def completions(
     )
 
 
-__all__ = ["completions"]
+__all__ = [
+    "completions",
+    "_configured_retry_codes",
+    "_should_retry_upstream",
+]

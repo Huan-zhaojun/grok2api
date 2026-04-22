@@ -19,6 +19,7 @@ from app.platform.config.snapshot import get_config
 from app.platform.errors import RateLimitError, UpstreamError
 from app.platform.runtime.clock import now_s
 from app.platform.tokens import estimate_prompt_tokens, estimate_tokens, estimate_tool_call_tokens
+from app.control.model.enums import ModeId
 from app.control.model.registry import resolve as resolve_model
 from app.control.account.enums import FeedbackKind
 from app.dataplane.reverse.protocol.xai_chat import classify_line, StreamAdapter
@@ -30,7 +31,9 @@ from app.dataplane.reverse.protocol.tool_parser import parse_tool_calls
 from app.products.openai.chat import (
     _stream_chat, _extract_message, _resolve_image,
     _quota_sync, _fail_sync, _parse_retry_codes, _feedback_kind, _log_task_exception,
+    _configured_retry_codes, _should_retry_upstream,
 )
+from app.products._account_selection import reserve_account, selection_max_retries
 from app.products.openai._tool_sieve import ToolSieve
 
 
@@ -307,8 +310,8 @@ async def create(
         raise RateLimitError("Account directory not initialised")
     directory = _acct_dir
 
-    max_retries = cfg.get_int("retry.max_retries", 1)
-    retry_codes = _parse_retry_codes(cfg.get_str("retry.on_codes", "429,503"))
+    max_retries = selection_max_retries()
+    retry_codes = _configured_retry_codes(cfg)
     timeout_s   = cfg.get_float("chat.timeout", 120.0)
     msg_id      = _make_msg_id()
 
@@ -318,11 +321,11 @@ async def create(
     async def _run_stream() -> AsyncGenerator[str, None]:
         excluded: list[str] = []
         for attempt in range(max_retries + 1):
-            acct = await directory.reserve(
-                pool_candidates = spec.pool_candidates(),
-                mode_id         = mode_id,
-                now_s_override  = now_s(),
-                exclude_tokens  = excluded or None,
+            acct, selected_mode_id = await reserve_account(
+                directory,
+                spec,
+                now_s_override=now_s(),
+                exclude_tokens=excluded or None,
             )
             if acct is None:
                 raise RateLimitError("No available accounts for this model tier")
@@ -363,7 +366,7 @@ async def create(
                     ended = False
                     async for line in _stream_chat(
                         token     = token,
-                        mode_id   = spec.mode_id,
+                        mode_id   = ModeId(selected_mode_id),
                         message   = internal_message,
                         files     = files,
                         timeout_s = timeout_s,
@@ -588,7 +591,7 @@ async def create(
 
                 except UpstreamError as exc:
                     fail_exc = exc
-                    if exc.status in retry_codes and attempt < max_retries:
+                    if _should_retry_upstream(exc, retry_codes) and attempt < max_retries:
                         _retry = True
                         logger.warning(
                             "messages stream retry: attempt={}/{} status={} token={}...",
@@ -604,11 +607,11 @@ async def create(
                     else _feedback_kind(fail_exc) if fail_exc
                     else FeedbackKind.SERVER_ERROR
                 )
-                await directory.feedback(token, kind, mode_id, now_s_val=now_s())
+                await directory.feedback(token, kind, selected_mode_id, now_s_val=now_s())
                 if success:
-                    asyncio.create_task(_quota_sync(token, mode_id)).add_done_callback(_log_task_exception)
+                    asyncio.create_task(_quota_sync(token, selected_mode_id)).add_done_callback(_log_task_exception)
                 else:
-                    asyncio.create_task(_fail_sync(token, mode_id, fail_exc)).add_done_callback(_log_task_exception)
+                    asyncio.create_task(_fail_sync(token, selected_mode_id, fail_exc)).add_done_callback(_log_task_exception)
 
             if success or not _retry:
                 return
@@ -625,11 +628,11 @@ async def create(
     adapter  = StreamAdapter()
 
     for attempt in range(max_retries + 1):
-        acct = await directory.reserve(
-            pool_candidates = spec.pool_candidates(),
-            mode_id         = mode_id,
-            now_s_override  = now_s(),
-            exclude_tokens  = excluded or None,
+        acct, selected_mode_id = await reserve_account(
+            directory,
+            spec,
+            now_s_override=now_s(),
+            exclude_tokens=excluded or None,
         )
         if acct is None:
             raise RateLimitError("No available accounts for this model tier")
@@ -645,7 +648,7 @@ async def create(
                 ended = False
                 async for line in _stream_chat(
                     token     = token,
-                    mode_id   = spec.mode_id,
+                    mode_id   = ModeId(selected_mode_id),
                     message   = internal_message,
                     files     = files,
                     timeout_s = timeout_s,
@@ -665,7 +668,7 @@ async def create(
 
             except UpstreamError as exc:
                 fail_exc = exc
-                if exc.status in retry_codes and attempt < max_retries:
+                if _should_retry_upstream(exc, retry_codes) and attempt < max_retries:
                     _retry = True
                     logger.warning(
                         "messages retry: attempt={}/{} status={} token={}...",
@@ -681,11 +684,11 @@ async def create(
                 else _feedback_kind(fail_exc) if fail_exc
                 else FeedbackKind.SERVER_ERROR
             )
-            await directory.feedback(token, kind, mode_id, now_s_val=now_s())
+            await directory.feedback(token, kind, selected_mode_id, now_s_val=now_s())
             if success:
-                asyncio.create_task(_quota_sync(token, mode_id)).add_done_callback(_log_task_exception)
+                asyncio.create_task(_quota_sync(token, selected_mode_id)).add_done_callback(_log_task_exception)
             else:
-                asyncio.create_task(_fail_sync(token, mode_id, fail_exc)).add_done_callback(_log_task_exception)
+                asyncio.create_task(_fail_sync(token, selected_mode_id, fail_exc)).add_done_callback(_log_task_exception)
 
         if success or not _retry:
             break

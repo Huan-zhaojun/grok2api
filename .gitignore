@@ -1,68 +1,47 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# Virtual Environment
-.venv/
-venv/
-ENV/
-env/
-
-# IDE
-.vscode/
+# OS and editors
+.DS_Store
+Thumbs.db
 .idea/
+.vscode/
 *.swp
 *.swo
 *~
-.DS_Store
 
-# Environment Variables
+# Local environment and secrets
 .env
+.env.*
+!.env.example
+/config.yaml
+/config.local.yaml
+/config.*.local.yaml
+/docs/*
+/docs/rules/*
+/backend/docs/goal/
+*.har
+*.pcap
+*.pcapng
 
-# Logs
-logs/
+# Runtime data
+/data/
+/backend/data/
 *.log
 
-# Data
-data/
+# Go
+/.gocache/
+/.gocache-*/
+/backend/grok2api
+/backend/coverage.out
+*.coverprofile
+*.test
 
-# Lint / Format Cache
-.ruff_cache/
-.mypy_cache/
+# Frontend
+/.pnpm-store/
+/frontend/node_modules/
+/frontend/dist/
+/frontend/.cache/
+/frontend/*.tsbuildinfo
 
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
-
-# Project specific
-.ace-tool/
-temp/
-tmp/
-
-# Claude Code（保留 settings.json 和 rules/ 可提交）
-.claude/settings.local.json
-.claude/index.json
-.claude/session-*
-
-# Playwright MCP
-.playwright-mcp/
+# Temporary files
+/release/
+/.tmp/
+/tmp/

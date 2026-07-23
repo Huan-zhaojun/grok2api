@@ -1,0 +1,14 @@
+# Line endings for this repo (Windows-friendly, Linux/Docker-safe).
+# Default: detect text; do not force every file's working-tree EOL.
+* text=auto
+
+# Scripts / container entry (must stay LF in the working tree for local docker build)
+*.sh            text eol=lf
+*.bash          text eol=lf
+docker/**       text eol=lf
+
+# Docker / Make (LF avoids subtle Windows/Git-Bash/Docker issues)
+Dockerfile      text eol=lf
+Dockerfile.*    text eol=lf
+Makefile        text eol=lf
+**/Makefile     text eol=lf

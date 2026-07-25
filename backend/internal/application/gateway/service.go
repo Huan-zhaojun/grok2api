@@ -616,9 +616,9 @@ attemptLoop:
 		var err error
 		selectionStarted := time.Now()
 		if ownership != nil {
-			lease, err = s.selector.AcquirePinned(ctx, route.Provider, ownership.AccountID, route.UpstreamModel, quotaMode, true)
+			lease, err = s.selector.AcquirePinned(ctx, route.Provider, ownership.AccountID, route.ID, route.UpstreamModel, quotaMode, true)
 		} else {
-			lease, err = s.selector.Acquire(ctx, route.Provider, route.UpstreamModel, quotaMode, affinityKey, excluded, !quotaProbeAttempted)
+			lease, err = s.selector.Acquire(ctx, route.Provider, route.ID, route.UpstreamModel, quotaMode, affinityKey, excluded, !quotaProbeAttempted)
 		}
 		timing.markSelection(time.Since(selectionStarted))
 		if err != nil {
@@ -740,8 +740,8 @@ attemptLoop:
 		}
 		egressForbidden := s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden
 		finalEgressForbidden := egressForbidden && (attempt > 0 || attempt+1 >= attempts)
-		// 403 必须先按响应体分类：contains blocked-user / user is blocked 时账号失效并换号；
-		// 仅当未命中封号正文时，才把 403 当作出口反爬重试（不惩罚账号）。禁止仅凭状态码或数字 code 失效。
+		// Classify 403 bodies before egress retry. Definitive blocked-account signals invalidate and rotate the account;
+		// all other 403 responses retain the egress retry path without penalizing the account.
 		if response.StatusCode == http.StatusForbidden {
 			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
 			body, _ := readRetryableBody(response.Body)
@@ -757,13 +757,13 @@ attemptLoop:
 				continue
 			}
 			if egressForbidden && !finalEgressForbidden {
-				// 非封号 403：出口/反爬会话问题，不惩罚账号。
+				// A non-blocking 403 is an egress/browser-session failure and must not penalize the account.
 				delete(excluded, credential.ID)
 				lease.Release()
 				lastErr = fmt.Errorf("上游出口会话被拒绝")
 				continue
 			}
-			// 最终一次非封号 403：body 已读，回填后走通用可重试/收尾逻辑。
+			// Restore the consumed final non-blocking 403 body for the common response path.
 			response.Body = io.NopCloser(bytes.NewReader(body))
 		}
 		if isRetryableResponse(response, route.Provider) && !finalEgressForbidden {
@@ -828,21 +828,17 @@ attemptLoop:
 				s.selector.MarkQuotaStateChanged(credential.Provider)
 				failureHandled = reconcileErr == nil && exhausted
 			} else if used, limit, exhausted := parseFreeQuotaExhaustion(body); exhausted {
-				s.selector.MarkFreeQuotaExhausted(ctx, credential, used, limit, quotaRecoveryHints{
-					Billing: lease.Billing, QuotaMode: lease.QuotaMode, RetryAfter: retryAfter,
-				})
+				s.selector.MarkFreeQuotaExhausted(ctx, credential, used, limit)
 				failureHandled = true
 			} else if lastFailure.ModelQuotaExhausted {
-				s.selector.MarkModelQuotaExhausted(ctx, credential, route.UpstreamModel, retryAfter)
+				s.selector.MarkModelQuotaExhausted(ctx, credential, lease.Billing, route.UpstreamModel, retryAfter)
 				failureHandled = true
 			} else if lastFailure.FreeQuotaExhausted {
-				s.selector.MarkFreeQuotaExhausted(ctx, credential, 0, 0, quotaRecoveryHints{
-					Billing: lease.Billing, QuotaMode: lease.QuotaMode, RetryAfter: retryAfter,
-				})
+				s.selector.MarkFreeQuotaExhausted(ctx, credential, 0, 0)
 				failureHandled = true
 			} else if lastFailure.QuotaExhausted {
 				s.selector.MarkPaymentQuotaExhausted(ctx, credential, quotaRecoveryHints{
-					Billing: lease.Billing, QuotaMode: lease.QuotaMode, RetryAfter: retryAfter,
+					Billing: lease.Billing,
 				})
 				failureHandled = true
 			}
@@ -1182,7 +1178,7 @@ func (s *Service) forwardOwnedResponse(ctx context.Context, input ResourceInput,
 		operation = "response_delete"
 	}
 	physicalCallCtx := infraegress.WithPhysicalCallTrace(ctx, string(ownership.Provider), operation)
-	lease, err := s.selector.AcquirePinned(ctx, ownership.Provider, ownership.AccountID, "", "", false)
+	lease, err := s.selector.AcquirePinned(ctx, ownership.Provider, ownership.AccountID, 0, "", "", false)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrResponseAccountUnavailable, err)
 	}

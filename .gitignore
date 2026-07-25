@@ -45,3 +45,10 @@ Thumbs.db
 /release/
 /.tmp/
 /tmp/
+
+# Playwright / browser automation artifacts
+.playwright-mcp/
+/playwright-report/
+/test-results/
+/blob-report/
+/playwright/.cache/

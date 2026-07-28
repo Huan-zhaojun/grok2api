@@ -80,13 +80,14 @@ type AccountRepository interface {
 	ListMissingConsoleSyncBatch(ctx context.Context, afterID uint64, limit int) ([]account.Credential, int64, int64, error)
 	HasActive(ctx context.Context, provider account.Provider) (bool, error)
 	ListRoutingCandidates(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode string) ([]account.RoutingCandidate, error)
+	GetCredentialMaterial(ctx context.Context, accountID uint64, provider account.Provider) (account.CredentialMaterial, error)
 	Get(ctx context.Context, id uint64) (account.Credential, error)
 	LinkWebToBuild(ctx context.Context, webAccountID, buildAccountID uint64) error
 	GetBillings(ctx context.Context, accountIDs []uint64) (map[uint64]account.Billing, error)
 	GetQuotaRecoveries(ctx context.Context, accountIDs []uint64) (map[uint64]account.QuotaRecovery, error)
 	UpsertByIdentity(ctx context.Context, value account.Credential) (account.Credential, bool, error)
 	Update(ctx context.Context, value account.Credential) (account.Credential, error)
-	UpdateMany(ctx context.Context, ids []uint64, updates AccountUpdates) (int64, error)
+	UpdateMany(ctx context.Context, provider account.Provider, ids []uint64, updates AccountUpdates) (int64, error)
 	Delete(ctx context.Context, id uint64) error
 	DeleteMany(ctx context.Context, ids []uint64) (int64, error)
 	// ResolveLinkedDeleteIDs expands root account IDs with one-hop (or Build/Console two-hop via Web)

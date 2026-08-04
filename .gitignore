@@ -34,6 +34,10 @@ Thumbs.db
 *.coverprofile
 *.test
 
+# Python
+__pycache__/
+*.py[cod]
+
 # Frontend
 /.pnpm-store/
 /frontend/node_modules/
@@ -45,6 +49,7 @@ Thumbs.db
 /release/
 /.tmp/
 /tmp/
+/Dockerfile.local
 
 # Playwright / browser automation artifacts
 .playwright-mcp/

@@ -215,6 +215,12 @@ Build Responses 整型工具参数按 schema 归一化（兼容 Codex 等严格�
 - 临时探针 / 一次性脚本 / 抓包产物 / 本地 SSO 样本：只放仓库根目录 `tmp/`（已 gitignore）。
 - **禁止**写入 `backend/`、`frontend/` 或其它源码树；用完可删，勿提交。
 
+### 绿地重建
+
+本地 dev 实例的 `./data/`（sqlite/媒体/运行态）**全部是随时可清可重建的测试数据**：
+破坏性验证、大批量导入、清池直接在 dev 环境做，**不必另起 tmp 隔离实例**；
+彻底重置 = 停服后挪走 `./data/backend.db` 再启动（管理端按 bootstrapAdmin 自动重建）。
+
 ### 安全边界
 
 - 勿提交：`config.yaml`、`.env*`、`data/`、真实凭据、HAR/pcap。

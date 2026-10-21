@@ -203,7 +203,7 @@ Build Responses 整型工具参数按 schema 归一化（兼容 Codex 等严格�
 判定方法：`git diff upstream/main..main --name-status` —— 看**树差**，不看历史提交（v2 时代的历史提交仍在祖先链上，但其内容早已放弃）。
 
 **常驻差异（fork 独有元文件，上游永远没有，合并不会触碰）**：  
-`CLAUDE.md`、`AGENTS.md`（符号链接）、`.gitattributes`、`.gitignore`。
+`CLAUDE.md`、`AGENTS.md`（符号链接）、`.gitattributes`、`.gitignore`、`tools/pre-push-guard.sh`、`tools/pre-push-guard-selftest.sh`。
 
 **规则**：新增下游定制前，先确认上游没有等价实现；评估合并影响时用树差，不要按提交名字猜。
 
@@ -247,6 +247,20 @@ git cherry-pick <main 上的提交>
 git push -u origin pr/<主题>          # -u 会同步把跟踪改到 origin（裸 checkout -b 会默认跟踪 upstream/main）
 gh pr create --repo chenyme/grok2api --base main --head Huan-zhaojun:pr/<主题> --title ... --body-file docs/pr-<主题>.md
 ```
+
+### 上游推送保护（本机配置，不入库）
+
+防误推 `chenyme/grok2api` 的两道闸；换机 / 重新 clone 后需重建：
+
+| 层 | 载体 | 作用 |
+|:--|:--|:--|
+| L1 | `.git/config` 的 `remote.upstream.pushurl` → 不可解析地址 | `upstream` 的一切推送在 transport 阶段即失败；`fetch`/`pull` 不受影响；`--no-verify` 绕不过 |
+| L2 | `.git/hooks/pre-push` ← `tools/pre-push-guard.sh` | 拦「裸 URL 指向上游」与「非 origin 远端的主线分支」；可被 `--no-verify` 绕过 |
+
+- 放行：`ALLOW_PROTECTED_PUSH=1`（仅对 L2）；L1 需先 `git remote set-url --push upstream <原URL>`
+- L2 依赖 `core.hooksPath` 为空才会被 git 发现
+- 自测：`bash tools/pre-push-guard-selftest.sh`（沙盒运行，零网络、零真实推送）
+- 细节与能力边界 → `tools/pre-push-guard.sh` 顶部注释
 
 ---
 

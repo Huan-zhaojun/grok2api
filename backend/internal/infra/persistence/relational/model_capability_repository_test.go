@@ -85,6 +85,189 @@ func TestModelCapabilitiesAggregateAndGateEnabledRoutes(t *testing.T) {
 	}
 }
 
+func TestConsoleBuiltInModelIgnoresStaleAccountCapabilitySnapshot(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	accounts := NewAccountRepository(database)
+	models := NewModelRepository(database)
+
+	credential, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderConsole, Name: "console", SourceKey: "console",
+		EncryptedAccessToken: testEncryptedToken, Enabled: true, AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := models.ReplaceAccountCapabilities(ctx, credential.ID, []string{"grok-4.3"}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+
+	candidates, err := accounts.ListRoutingCandidates(ctx, account.ProviderConsole, 0, "grok-imagine-image-quality", "console_image")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 || !candidates[0].ModelCapabilityKnown || !candidates[0].SupportsModel {
+		t.Fatalf("built-in Console model must survive a stale account snapshot: %#v", candidates)
+	}
+
+	candidates, err = accounts.ListRoutingCandidates(ctx, account.ProviderConsole, 0, "unknown-console-model", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 || !candidates[0].ModelCapabilityKnown || candidates[0].SupportsModel {
+		t.Fatalf("unknown Console model must retain capability gating: %#v", candidates)
+	}
+}
+
+func TestConsoleCatalogRoutesUseAutomaticAccountPoolWithoutCapabilitySnapshot(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	accounts := NewAccountRepository(database)
+	models := NewModelRepository(database)
+
+	createAccount := func(name string) account.Credential {
+		t.Helper()
+		value, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+			Provider: account.ProviderConsole, Name: name, SourceKey: name,
+			EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	first := createAccount("console-first")
+	second := createAccount("console-second")
+	disabled := createAccount("console-disabled")
+	disabled.Enabled = false
+	if _, err := accounts.Update(ctx, disabled); err != nil {
+		t.Fatal(err)
+	}
+	reauth := createAccount("console-reauth")
+	reauth.AuthStatus = account.AuthStatusReauthRequired
+	if _, err := accounts.Update(ctx, reauth); err != nil {
+		t.Fatal(err)
+	}
+
+	const publicID = "grok-imagine-image-quality"
+	if err := models.UpsertRoutes(ctx, []model.Route{
+		{PublicID: publicID, Provider: account.ProviderConsole, UpstreamModel: publicID, Capability: model.CapabilityImage, Origin: model.OriginCatalog, Enabled: true},
+		{PublicID: publicID, Provider: account.ProviderConsole, UpstreamModel: publicID, Capability: model.CapabilityImageEdit, Origin: model.OriginCatalog, Enabled: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	enabled, err := models.ListEnabled(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(enabled) != 2 {
+		t.Fatalf("enabled Console routes = %#v", enabled)
+	}
+	for _, route := range enabled {
+		if route.SupportedAccounts != 2 || route.TotalAccounts != 2 || route.SyncedAccounts != 0 || len(route.BoundAccountIDs) != 0 {
+			t.Fatalf("automatic Console account pool = %#v", route)
+		}
+	}
+	unknown, err := models.Create(ctx, model.Route{
+		PublicID: "legacy-unknown-console", Provider: account.ProviderConsole, UpstreamModel: "unknown-console-model",
+		Capability: model.CapabilityImage, Enabled: true,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unknown.SupportedAccounts != 0 || unknown.TotalAccounts != 2 {
+		t.Fatalf("unknown Console route must not inherit static catalog support: %#v", unknown)
+	}
+	if enabledAfterUnknown, err := models.ListEnabled(ctx); err != nil || len(enabledAfterUnknown) != 2 {
+		t.Fatalf("unknown Console route leaked into enabled routes: %#v, err=%v", enabledAfterUnknown, err)
+	}
+	alias, err := models.Create(ctx, model.Route{
+		PublicID: "console-image-alias", Provider: account.ProviderConsole, UpstreamModel: publicID,
+		Capability: model.CapabilityImage, Enabled: true,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if alias.SupportedAccounts != 2 || alias.TotalAccounts != 2 {
+		t.Fatalf("manual alias for Console catalog route = %#v", alias)
+	}
+
+	boundIDs := []uint64{first.ID}
+	boundRoute := enabled[0]
+	boundRoute, err = models.Update(ctx, boundRoute, &boundIDs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if boundRoute.SupportedAccounts != 1 || boundRoute.TotalAccounts != 1 || len(boundRoute.BoundAccountIDs) != 1 || boundRoute.BoundAccountIDs[0] != first.ID {
+		t.Fatalf("manually bound Console route = %#v; second=%d", boundRoute, second.ID)
+	}
+}
+
+func TestModelRouteGroupsKeepCapabilitiesCompleteAcrossStatusFilters(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	models := NewModelRepository(database)
+
+	const publicID = "grouped-console-image"
+	if err := models.UpsertRoutes(ctx, []model.Route{
+		{PublicID: publicID, Provider: account.ProviderConsole, UpstreamModel: "grok-imagine-image", Capability: model.CapabilityImage, Origin: model.OriginCatalog, Enabled: true},
+		{PublicID: publicID, Provider: account.ProviderConsole, UpstreamModel: "grok-imagine-image", Capability: model.CapabilityImageEdit, Origin: model.OriginCatalog, Enabled: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	values, total, err := models.ListGroups(ctx, repository.ModelListQuery{Page: repository.PageQuery{Limit: 20}})
+	if err != nil || total != 1 || len(values) != 1 || len(values[0].Routes) != 2 {
+		t.Fatalf("initial groups = %#v, total=%d, err=%v", values, total, err)
+	}
+	disabled := false
+	editRoute := values[0].Routes[0]
+	if editRoute.Capability != model.CapabilityImageEdit {
+		editRoute = values[0].Routes[1]
+	}
+	editRoute.Enabled = false
+	if _, err := models.Update(ctx, editRoute, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	enabled := true
+	values, total, err = models.ListGroups(ctx, repository.ModelListQuery{
+		Page: repository.PageQuery{Limit: 1}, Filter: repository.ModelListFilter{Enabled: &enabled},
+	})
+	if err != nil || total != 1 || len(values) != 1 || len(values[0].Routes) != 2 {
+		t.Fatalf("enabled-filtered groups lost a capability: %#v, total=%d, err=%v", values, total, err)
+	}
+	if values[0].Routes[0].Enabled == values[0].Routes[1].Enabled {
+		t.Fatalf("mixed group status was not preserved: %#v", values[0])
+	}
+	values, total, err = models.ListGroups(ctx, repository.ModelListQuery{
+		Page: repository.PageQuery{Limit: 20}, Filter: repository.ModelListFilter{Enabled: &disabled},
+	})
+	if err != nil || total != 0 || len(values) != 0 {
+		t.Fatalf("partially enabled group leaked into disabled filter: %#v, total=%d, err=%v", values, total, err)
+	}
+
+	for _, capability := range []model.Capability{model.CapabilityImage, model.CapabilityImageEdit} {
+		if _, err := models.Create(ctx, model.Route{
+			PublicID: "manual-group-target", Provider: account.ProviderConsole, UpstreamModel: "grok-imagine-image",
+			Capability: capability, Enabled: true,
+		}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	values, total, err = models.ListGroups(ctx, repository.ModelListQuery{Page: repository.PageQuery{Limit: 20}})
+	if err != nil || total != 3 || len(values) != 3 {
+		t.Fatalf("manual targets must remain independent: %#v, total=%d, err=%v", values, total, err)
+	}
+	for _, field := range []string{"publicId", "upstreamModel", "status", "provider", "accountSupport", "lastSyncedAt"} {
+		if _, _, err := models.ListGroups(ctx, repository.ModelListQuery{Page: repository.PageQuery{
+			Limit: 20, Sort: repository.SortQuery{Field: field, Direction: repository.SortDescending},
+		}}); err != nil {
+			t.Fatalf("sort grouped models by %s: %v", field, err)
+		}
+	}
+}
+
 func TestBuildPaidCapabilitiesAreSharedAcrossActiveSuperAccounts(t *testing.T) {
 	ctx := context.Background()
 	database := openTestDatabase(t)
@@ -373,6 +556,130 @@ func TestReplaceProviderRoutesCanRenameUpstreamModels(t *testing.T) {
 	}
 }
 
+func TestReplaceProviderRoutesSplitsWebImagineProtocolProducts(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	repo := NewModelRepository(database)
+	if err := repo.UpsertRoutes(ctx, []model.Route{
+		{PublicID: "grok-imagine-image-lite", Provider: account.ProviderWeb, UpstreamModel: "grok-imagine-image", Capability: model.CapabilityImage, Enabled: true},
+		{PublicID: "grok-imagine-image-quality-lite", Provider: account.ProviderWeb, UpstreamModel: "grok-imagine-image-quality", Capability: model.CapabilityImage, Enabled: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var before []modelRouteModel
+	if err := database.db.WithContext(ctx).Where("provider = ?", account.ProviderWeb).Order("upstream_model ASC").Find(&before).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(before) != 2 {
+		t.Fatalf("before = %#v", before)
+	}
+	fastID, qualityID := before[0].ID, before[1].ID
+	for _, alias := range []string{"Web/grok-imagine-image", "Web/grok-imagine-image-2.0"} {
+		if err := database.db.WithContext(ctx).Create(&modelRouteAliasModel{Alias: alias, ModelRouteID: fastID}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := repo.ReplaceProviderRoutes(ctx, account.ProviderWeb, []model.Route{
+		{PublicID: "grok-imagine-image-lite", Provider: account.ProviderWeb, UpstreamModel: "grok-imagine-image", Capability: model.CapabilityImage, Enabled: true},
+		{PublicID: "grok-imagine-image", Provider: account.ProviderWeb, UpstreamModel: "grok-imagine-image-quality", Capability: model.CapabilityImage, Enabled: true},
+		{PublicID: "grok-imagine-image-2.0", Provider: account.ProviderWeb, UpstreamModel: "grok-imagine-image-2.0", Capability: model.CapabilityImage, Enabled: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var after []modelRouteModel
+	if err := database.db.WithContext(ctx).Where("provider = ?", account.ProviderWeb).Order("upstream_model ASC").Find(&after).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != 3 {
+		t.Fatalf("renamed routes = %#v", after)
+	}
+	byUpstream := make(map[string]modelRouteModel, len(after))
+	for _, route := range after {
+		byUpstream[route.UpstreamModel] = route
+	}
+	if route := byUpstream["grok-imagine-image"]; route.ID != fastID || route.PublicID != "Web/grok-imagine-image-lite" {
+		t.Fatalf("fast route = %#v", route)
+	}
+	if route := byUpstream["grok-imagine-image-quality"]; route.ID != qualityID || route.PublicID != "Web/grok-imagine-image" {
+		t.Fatalf("standard Imagine route = %#v", route)
+	}
+	if route := byUpstream["grok-imagine-image-2.0"]; route.ID == 0 || route.PublicID != "Web/grok-imagine-image-2.0" {
+		t.Fatalf("Imagine 2.0 route = %#v", route)
+	}
+	if _, err := repo.GetByPublicIDIncludingDisabled(ctx, "grok-imagine-image-quality-lite"); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("retired Web image model remains callable: %v", err)
+	}
+	var promotedAliasCount int64
+	if err := database.db.WithContext(ctx).Model(&modelRouteAliasModel{}).
+		Where("alias IN ?", []string{"Web/grok-imagine-image", "Web/grok-imagine-image-2.0"}).
+		Count(&promotedAliasCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if promotedAliasCount != 0 {
+		t.Fatalf("promoted aliases remain: %d", promotedAliasCount)
+	}
+}
+
+func TestReplaceProviderRoutesRestoresThreeConsoleImageModels(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	repo := NewModelRepository(database)
+	legacyCatalog := []model.Route{
+		{PublicID: "grok-imagine-image-quality-2.0", Provider: account.ProviderConsole, UpstreamModel: "grok-imagine-image-quality", Capability: model.CapabilityImage, Enabled: true},
+		{PublicID: "grok-imagine-image-quality-2.0", Provider: account.ProviderConsole, UpstreamModel: "grok-imagine-image-quality", Capability: model.CapabilityImageEdit, Enabled: true},
+		{PublicID: "grok-imagine-image-2.0", Provider: account.ProviderConsole, UpstreamModel: "grok-imagine-image", Capability: model.CapabilityImage, Enabled: true},
+		{PublicID: "grok-imagine-image-2.0", Provider: account.ProviderConsole, UpstreamModel: "grok-imagine-image", Capability: model.CapabilityImageEdit, Enabled: true},
+	}
+	if err := repo.UpsertRoutes(ctx, legacyCatalog); err != nil {
+		t.Fatal(err)
+	}
+	var before []modelRouteModel
+	if err := database.db.WithContext(ctx).Where("provider = ?", account.ProviderConsole).Find(&before).Error; err != nil {
+		t.Fatal(err)
+	}
+	beforeIDs := make(map[string]uint64, len(before))
+	for _, route := range before {
+		beforeIDs[route.UpstreamModel+"|"+route.Capability] = route.ID
+	}
+	desiredCatalog := []model.Route{
+		// Legacy and quality must be reconciled before the new 2.0 route so the
+		// rows created by the temporary two-model catalog retain their IDs.
+		{PublicID: "grok-imagine-image", Provider: account.ProviderConsole, UpstreamModel: "grok-imagine-image", Capability: model.CapabilityImage, Enabled: true},
+		{PublicID: "grok-imagine-image", Provider: account.ProviderConsole, UpstreamModel: "grok-imagine-image", Capability: model.CapabilityImageEdit, Enabled: true},
+		{PublicID: "grok-imagine-image-quality", Provider: account.ProviderConsole, UpstreamModel: "grok-imagine-image-quality", Capability: model.CapabilityImage, Enabled: true},
+		{PublicID: "grok-imagine-image-quality", Provider: account.ProviderConsole, UpstreamModel: "grok-imagine-image-quality", Capability: model.CapabilityImageEdit, Enabled: true},
+		{PublicID: "grok-imagine-image-2.0", Provider: account.ProviderConsole, UpstreamModel: "grok-imagine-image-2.0", Capability: model.CapabilityImage, Enabled: true},
+		{PublicID: "grok-imagine-image-2.0", Provider: account.ProviderConsole, UpstreamModel: "grok-imagine-image-2.0", Capability: model.CapabilityImageEdit, Enabled: true},
+	}
+	for range 2 {
+		if err := repo.ReplaceProviderRoutes(ctx, account.ProviderConsole, desiredCatalog); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var after []modelRouteModel
+	if err := database.db.WithContext(ctx).Where("provider = ? AND upstream_model LIKE ?", account.ProviderConsole, "grok-imagine-image%").Order("id ASC").Find(&after).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != 6 {
+		t.Fatalf("Console image routes = %#v", after)
+	}
+	seen := make(map[string]map[string]bool)
+	for _, route := range after {
+		if seen[route.PublicID] == nil {
+			seen[route.PublicID] = make(map[string]bool)
+		}
+		seen[route.PublicID][route.Capability] = true
+		if route.UpstreamModel != "grok-imagine-image-2.0" && beforeIDs[route.UpstreamModel+"|"+route.Capability] != route.ID {
+			t.Fatalf("existing Console route ID changed: before=%#v after=%#v", before, after)
+		}
+	}
+	for _, publicID := range []string{"Console/grok-imagine-image", "Console/grok-imagine-image-quality", "Console/grok-imagine-image-2.0"} {
+		if !seen[publicID][string(model.CapabilityImage)] || !seen[publicID][string(model.CapabilityImageEdit)] {
+			t.Fatalf("Console image capabilities for %s = %#v", publicID, seen[publicID])
+		}
+	}
+}
+
 func TestManualModelRouteBindingsAndRediscovery(t *testing.T) {
 	ctx := context.Background()
 	database := openTestDatabase(t)
@@ -514,6 +821,104 @@ func TestWebRediscoveryRestoresCatalogRouteDefaults(t *testing.T) {
 	}
 	if items[0].PublicID != value.PublicID || items[0].Capability != model.CapabilityImageEdit || items[0].Origin != model.OriginDiscovered {
 		t.Fatalf("rediscovered web route defaults = %#v", items[0])
+	}
+}
+
+func TestWebBasicMediaCatalogRemainsAvailableAcrossStaleSnapshots(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	accounts := NewAccountRepository(database)
+	models := NewModelRepository(database)
+	basic, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, Name: "basic-web", SourceKey: "basic-web",
+		EncryptedAccessToken: testEncryptedToken, Enabled: true, AuthStatus: account.AuthStatusActive, WebTier: account.WebTierBasic,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Record a successful historical sync that predates Basic image-edit and
+	// video support.
+	if err := models.ReplaceAccountCapabilities(ctx, basic.ID, []string{"grok-chat-fast"}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := models.UpsertRoutes(ctx, []model.Route{
+		{
+			PublicID: "grok-imagine-image", Provider: account.ProviderWeb, UpstreamModel: "grok-imagine-image-quality",
+			Capability: model.CapabilityImage, Origin: model.OriginCatalog, Enabled: true,
+		},
+		{
+			PublicID: "grok-imagine-image-2.0", Provider: account.ProviderWeb, UpstreamModel: "grok-imagine-image-2.0",
+			Capability: model.CapabilityImage, Origin: model.OriginCatalog, Enabled: true,
+		},
+		{
+			PublicID: "grok-imagine-image-edit", Provider: account.ProviderWeb, UpstreamModel: "imagine-image-edit",
+			Capability: model.CapabilityImageEdit, Origin: model.OriginCatalog, Enabled: true,
+		},
+		{
+			PublicID: "grok-imagine-video", Provider: account.ProviderWeb, UpstreamModel: "grok-imagine-video",
+			Capability: model.CapabilityVideo, Origin: model.OriginCatalog, Enabled: true,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	routes, err := models.ListEnabled(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mediaRoutes := make(map[string]model.Route)
+	for index := range routes {
+		if routes[index].Provider == account.ProviderWeb {
+			mediaRoutes[routes[index].UpstreamModel] = routes[index]
+		}
+	}
+	for _, upstreamModel := range []string{"grok-imagine-image-quality", "grok-imagine-image-2.0", "imagine-image-edit", "grok-imagine-video"} {
+		value, ok := mediaRoutes[upstreamModel]
+		if !ok || value.SupportedAccounts != 1 || value.TotalAccounts != 1 {
+			t.Fatalf("Web Basic media route %s = %#v; routes=%#v", upstreamModel, value, routes)
+		}
+	}
+	quotaModes := map[string]string{
+		"grok-imagine-image-quality": account.QuotaModeWebImagePro,
+		"grok-imagine-image-2.0":     account.QuotaModeWebImagePro,
+		"imagine-image-edit":         account.QuotaModeWebImageEdit,
+		"grok-imagine-video":         account.QuotaModeWebVideo720p,
+	}
+	for upstreamModel, quotaMode := range quotaModes {
+		route := mediaRoutes[upstreamModel]
+		candidates, candidateErr := accounts.ListRoutingCandidates(ctx, account.ProviderWeb, route.ID, upstreamModel, quotaMode)
+		if candidateErr != nil || len(candidates) != 1 || !candidates[0].ModelCapabilityKnown || !candidates[0].SupportsModel {
+			t.Fatalf("Web Basic routing candidate %s = %#v, err=%v", upstreamModel, candidates, candidateErr)
+		}
+	}
+	unknown, err := models.Create(ctx, model.Route{
+		PublicID: "unknown-web-image-edit", Provider: account.ProviderWeb, UpstreamModel: "unknown-image-edit",
+		Capability: model.CapabilityImageEdit, Enabled: true,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unknown.SupportedAccounts != 0 {
+		t.Fatalf("unknown Web route inherited catalog support: %#v", unknown)
+	}
+}
+
+func TestWebImageRediscoveryUsesProtocolProductNames(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	repo := NewModelRepository(database)
+	tests := map[string]string{
+		"grok-imagine-image":         "Web/grok-imagine-image-lite",
+		"grok-imagine-image-quality": "Web/grok-imagine-image",
+		"grok-imagine-image-2.0":     "Web/grok-imagine-image-2.0",
+	}
+	for upstreamModel, publicID := range tests {
+		if err := repo.UpsertDiscovered(ctx, account.ProviderWeb, []string{upstreamModel}); err != nil {
+			t.Fatal(err)
+		}
+		route, err := repo.GetByPublicIDIncludingDisabled(ctx, publicID)
+		if err != nil || route.UpstreamModel != upstreamModel || route.Capability != model.CapabilityImage {
+			t.Fatalf("rediscovered %s as %#v, err=%v", upstreamModel, route, err)
+		}
 	}
 }
 

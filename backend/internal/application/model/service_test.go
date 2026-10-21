@@ -31,6 +31,137 @@ func TestModelProviderFilterAcceptsOnlyKnownProviders(t *testing.T) {
 	}
 }
 
+func TestEndpointCapabilitiesFollowProviderSurface(t *testing.T) {
+	routes := []modeldomain.Route{
+		{Provider: account.ProviderConsole, Capability: modeldomain.CapabilityResponses},
+		{Provider: account.ProviderConsole, Capability: modeldomain.CapabilityImage},
+		{Provider: account.ProviderConsole, Capability: modeldomain.CapabilityImageEdit},
+	}
+	capabilities := endpointCapabilitiesForDefinition(routes, provider.Definition{
+		Conversation: provider.ConversationSurface{Responses: true, Messages: true},
+		Media:        provider.MediaSurface{ImageGeneration: true},
+	})
+	want := []string{"responses", "messages", "image"}
+	if fmt.Sprint(capabilities) != fmt.Sprint(want) {
+		t.Fatalf("endpoint capabilities = %v, want %v", capabilities, want)
+	}
+}
+
+func TestCreateAndUpdatePreserveProviderPrefixedPublicNames(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "provider-prefixed-public-name.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	modelRepo := relational.NewModelRepository(database)
+	accountRepo := relational.NewAccountRepository(database)
+	registry := provider.NewRegistry(&modelRouteAdapter{modelCapabilityAdapter: &modelCapabilityAdapter{}})
+	service := NewService(modelRepo, accountRepo, nil, registry)
+
+	created, err := service.Create(ctx, CreateInput{
+		PublicID: "Build/grok-4.5", Provider: account.ProviderBuild, UpstreamModel: "grok-4.5",
+		Capability: modeldomain.CapabilityResponses, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.PublicID != "Build/Build/grok-4.5" || modeldomain.ExternalPublicID(created.Provider, created.PublicID) != "Build/grok-4.5" {
+		t.Fatalf("created route = %#v", created)
+	}
+
+	if err := modelRepo.UpsertDiscovered(ctx, account.ProviderBuild, []string{"grok-edit"}); err != nil {
+		t.Fatal(err)
+	}
+	toEdit, err := modelRepo.GetByPublicIDIncludingDisabled(ctx, "grok-edit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicID := "Build/grok-edit"
+	updated, err := service.Update(ctx, toEdit.ID, UpdateInput{PublicID: &publicID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.PublicID != "Build/Build/grok-edit" || modeldomain.ExternalPublicID(updated.Provider, updated.PublicID) != publicID {
+		t.Fatalf("updated route = %#v", updated)
+	}
+	if err := modelRepo.UpsertDiscovered(ctx, account.ProviderBuild, []string{"grok-edit"}); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := modelRepo.GetByPublicIDIncludingDisabled(ctx, publicID)
+	if err != nil || resolved.ID != updated.ID {
+		t.Fatalf("resolved updated route = %#v, err = %v", resolved, err)
+	}
+}
+
+func TestNormalizeBatchIDsAllowsGroupedRouteExpansion(t *testing.T) {
+	ids := make([]uint64, maxModelBatchSize)
+	for index := range ids {
+		ids[index] = uint64(index + 1)
+	}
+	if values, err := normalizeModelRouteBatchIDs(ids); err != nil || len(values) != maxModelBatchSize {
+		t.Fatalf("expanded grouped batch = %d, err=%v", len(values), err)
+	}
+	ids = append(ids, uint64(maxModelBatchSize+1))
+	if _, err := normalizeModelRouteBatchIDs(ids); err == nil {
+		t.Fatal("oversized grouped batch was accepted")
+	}
+}
+
+func TestValidateBoundAccountsSupportsAccountsFilteredByIDs(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "model-bound-accounts.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	modelRepo := relational.NewModelRepository(database)
+	accountRepo := relational.NewAccountRepository(database)
+	registry := provider.NewRegistry(&modelRouteAdapter{modelCapabilityAdapter: &modelCapabilityAdapter{}})
+	service := NewService(modelRepo, accountRepo, nil, registry)
+
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := cipher.Encrypt("access-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	targetAccount, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider:             account.ProviderBuild,
+		Name:                 "target-account",
+		SourceKey:            "target-account",
+		EncryptedAccessToken: encrypted,
+		ExpiresAt:            time.Now().Add(time.Hour),
+		AuthStatus:           account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bound, err := service.validateBoundAccounts(ctx, account.ProviderBuild, []uint64{targetAccount.ID})
+	if err != nil {
+		t.Fatalf("validateBoundAccounts failed: %v", err)
+	}
+	if len(bound) != 1 || bound[0] != targetAccount.ID {
+		t.Fatalf("bound accounts = %v, want [%d]", bound, targetAccount.ID)
+	}
+
+	_, err = service.validateBoundAccounts(ctx, account.ProviderWeb, []uint64{targetAccount.ID})
+	if err == nil {
+		t.Fatal("expected error for mismatched provider, got nil")
+	}
+}
+
+
 func TestSyncAggregatesCapabilitiesFromAllAccounts(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "model-sync.db"))
@@ -341,6 +472,19 @@ type modelCapabilityAdapter struct {
 // buildCapabilityNormalizerAdapter simulates a Build Adapter implementing optional capability normalization.
 type buildCapabilityNormalizerAdapter struct {
 	*modelCapabilityAdapter
+}
+
+type modelRouteAdapter struct {
+	*modelCapabilityAdapter
+}
+
+func (a *modelRouteAdapter) Definition() provider.Definition {
+	return provider.Definition{
+		Provider:          account.ProviderBuild,
+		ModelNamespace:    account.ProviderBuild.ModelNamespace(),
+		ModelCatalog:      provider.ModelCatalogRemote,
+		ModelCapabilities: []modeldomain.Capability{modeldomain.CapabilityResponses},
+	}
 }
 
 func (a *buildCapabilityNormalizerAdapter) NormalizeAccountModelCapabilities(models []string, billing *account.Billing, credential account.Credential) []string {

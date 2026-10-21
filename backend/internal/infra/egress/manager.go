@@ -137,41 +137,42 @@ func (l *Lease) Release() {
 }
 
 type Manager struct {
-	repository           repository.EgressRepository
-	cipher               *security.Cipher
-	logger               *slog.Logger
-	nodeMu               sync.RWMutex
-	clientMu             sync.RWMutex
-	clearanceMu          sync.Mutex
-	operationsMu         sync.RWMutex
-	clients              map[clientCacheKey]cachedClient
-	inflight             sync.Map
-	nodes                map[domain.Scope]cachedNodeSnapshot
-	healthyNodes         map[uint64]time.Time
-	nodeVersions         map[domain.Scope]uint64
-	nodeLoads            singleflight.Group
-	clientLoads          singleflight.Group
-	clientVersions       map[uint64]uint64
-	clientGeneration     uint64
-	buildHeaderTimeout   atomic.Int64
-	accountIsolated      atomic.Bool
-	operationsConfig     cachedOperationsConfig
-	operationsConfigLoad singleflight.Group
-	operationsConfigVer  uint64
-	failureProbeMu       sync.Mutex
-	failureProber        FailureProber
-	failureProbes        map[uint64]failureProbeState
-	lastClientCleanup    time.Time
-	clearanceLoads       singleflight.Group
-	clearanceConfig      ClearanceConfig
-	clearanceVersion     uint64
-	clearances           map[string]clearanceState
-	lastClearanceCleanup time.Time
-	solver               clearanceSolver
-	clearanceLock        repository.DistributedLock
-	newBuildClient       func(string, time.Duration) (requestClient, error)
-	newBuildEnvClient    func(time.Duration) (requestClient, error)
-	newBrowserClient     func(string, string) (*browserClient, error)
+	repository             repository.EgressRepository
+	cipher                 *security.Cipher
+	logger                 *slog.Logger
+	nodeMu                 sync.RWMutex
+	clientMu               sync.RWMutex
+	clearanceMu            sync.Mutex
+	operationsMu           sync.RWMutex
+	clients                map[clientCacheKey]cachedClient
+	inflight               sync.Map
+	nodes                  map[domain.Scope]cachedNodeSnapshot
+	healthyNodes           map[uint64]time.Time
+	nodeVersions           map[domain.Scope]uint64
+	nodeLoads              singleflight.Group
+	clientLoads            singleflight.Group
+	clientVersions         map[uint64]uint64
+	clientGeneration       uint64
+	buildHeaderTimeout     atomic.Int64
+	buildStreamIdleTimeout atomic.Int64
+	accountIsolated        atomic.Bool
+	operationsConfig       cachedOperationsConfig
+	operationsConfigLoad   singleflight.Group
+	operationsConfigVer    uint64
+	failureProbeMu         sync.Mutex
+	failureProber          FailureProber
+	failureProbes          map[uint64]failureProbeState
+	lastClientCleanup      time.Time
+	clearanceLoads         singleflight.Group
+	clearanceConfig        ClearanceConfig
+	clearanceVersion       uint64
+	clearances             map[string]clearanceState
+	lastClearanceCleanup   time.Time
+	solver                 clearanceSolver
+	clearanceLock          repository.DistributedLock
+	newBuildClient         func(string, time.Duration) (requestClient, error)
+	newBuildEnvClient      func(time.Duration) (requestClient, error)
+	newBrowserClient       func(string, string) (*browserClient, error)
 }
 
 type clearanceState struct {
@@ -234,6 +235,7 @@ func NewManager(repository repository.EgressRepository, cipher *security.Cipher)
 		clearanceConfig: ClearanceConfig{Mode: "manual", TargetURL: "https://grok.com", Timeout: time.Minute, RefreshInterval: 10 * time.Minute},
 	}
 	manager.buildHeaderTimeout.Store(int64(settingsdomain.DefaultBuildResponseHeaderTimeout))
+	manager.buildStreamIdleTimeout.Store(int64(settingsdomain.DefaultBuildStreamIdleTimeout))
 	return manager
 }
 
@@ -348,6 +350,22 @@ func (m *Manager) UpdateBuildResponseHeaderTimeout(value time.Duration) {
 	}
 	m.clientMu.Unlock()
 	closeRequestClients(stale)
+}
+
+// UpdateBuildStreamIdleTimeout affects subsequent Build streams. Active
+// response bodies retain the deadline captured by their existing wrapper and
+// are not interrupted; the underlying HTTP connection pool is unchanged.
+func (m *Manager) UpdateBuildStreamIdleTimeout(value time.Duration) {
+	if value <= 0 {
+		value = settingsdomain.DefaultBuildStreamIdleTimeout
+	}
+	m.buildStreamIdleTimeout.Store(int64(value))
+}
+
+// BuildStreamIdleTimeout returns the configured stream idle deadline for Grok
+// Build responses. Returns zero when idle enforcement is disabled.
+func (m *Manager) BuildStreamIdleTimeout() time.Duration {
+	return time.Duration(m.buildStreamIdleTimeout.Load())
 }
 
 // UpdateAccountIsolatedConnections toggles per-account upstream connection pools.
@@ -794,7 +812,8 @@ func decodeProbeIP(body []byte) (string, error) {
 
 func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity string, allowDirect bool, encryptedCredentialCookies string, boundNodeID uint64) (*Lease, bool, error) {
 	now := time.Now().UTC()
-	managedClearance := isGrokWebScope(scope) && m.clearanceMode() == "flaresolverr"
+	clearanceMode := m.clearanceMode()
+	managedClearance := isGrokWebScope(scope) && (clearanceMode == "flaresolverr" || clearanceMode == "on_demand")
 	configured := false
 	var available []domain.Node
 	if boundNodeID != 0 {
@@ -838,10 +857,10 @@ func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity stri
 	}
 	fallbackConfig, fallbackSupported, fallbackConfigErr := m.loadOperationsConfig(ctx, now)
 	fallback := domain.FallbackConfig{Mode: domain.FallbackModeNone}
-	reservedFallbackNodes := make(map[uint64]struct{}, 4)
+	reservedFallbackNodes := make(map[uint64]struct{}, len(allEgressScopes()))
 	if fallbackConfigErr == nil && fallbackSupported {
 		fallback = fallbackConfig.FallbackFor(scope)
-		for _, fallbackScope := range []domain.Scope{domain.ScopeBuild, domain.ScopeWeb, domain.ScopeConsole, domain.ScopeWebAsset} {
+		for _, fallbackScope := range allEgressScopes() {
 			configuredFallback := fallbackConfig.FallbackFor(fallbackScope)
 			if configuredFallback.Mode == domain.FallbackModeFixed && configuredFallback.NodeID != 0 {
 				reservedFallbackNodes[configuredFallback.NodeID] = struct{}{}
@@ -1062,7 +1081,7 @@ func (m *Manager) leaseForNode(ctx context.Context, scope domain.Scope, affinity
 
 func (m *Manager) leaseForNodeWithOptions(ctx context.Context, scope domain.Scope, affinity, encryptedCredentialCookies string, managedClearance bool, selected domain.Node, options clientOptions) (*Lease, bool, error) {
 	credentialCookies := ""
-	if !managedClearance && scope != domain.ScopeBuild && strings.TrimSpace(encryptedCredentialCookies) != "" {
+	if !managedClearance && usesBrowserClearance(scope) && strings.TrimSpace(encryptedCredentialCookies) != "" {
 		decryptedCookies, decryptErr := m.cipher.Decrypt(encryptedCredentialCookies)
 		if decryptErr != nil {
 			return nil, true, decryptErr
@@ -1091,7 +1110,7 @@ func (m *Manager) leaseForNodeWithOptions(ctx context.Context, scope domain.Scop
 		}
 	}
 	cookies := ""
-	if scope != domain.ScopeBuild {
+	if usesBrowserClearance(scope) {
 		cookies, err = m.cipher.Decrypt(selected.EncryptedCloudflareCookie)
 		if err != nil {
 			// Managed mode can recover a damaged persisted cookie by asking the
@@ -1127,7 +1146,10 @@ func (m *Manager) leaseForNodeWithOptions(ctx context.Context, scope domain.Scop
 	// Derive identity independently of the current toggle. clientFor applies one
 	// authoritative toggle snapshot, so enabling isolation between these two
 	// stages cannot accidentally place an account request in the shared bucket.
-	accountIdentity := isolationAccountIdentity(ctx, scope, affinity)
+	accountIdentity := ""
+	if scope != domain.ScopeConsoleAsset {
+		accountIdentity = isolationAccountIdentity(ctx, scope, affinity)
+	}
 	client, err := m.clientForWithOptions(selected.ID, scope, proxyURL, userAgent, cookies, sticky, accountIdentity, options)
 	if err != nil {
 		return nil, false, err
@@ -1140,6 +1162,14 @@ func (m *Manager) leaseForNodeWithOptions(ctx context.Context, scope domain.Scop
 			m.decrementInflight(selected.ID)
 		})
 	}}, true, nil
+}
+
+// Console assets are served from public media hosts. They still need the
+// selected proxy and browser user agent, but forwarding account or node
+// clearance cookies would unnecessarily expose credentials to a different
+// origin and make an otherwise anonymous download depend on cookie storage.
+func usesBrowserClearance(scope domain.Scope) bool {
+	return scope != domain.ScopeBuild && scope != domain.ScopeConsoleAsset
 }
 
 func (m *Manager) inflightCounter(nodeID uint64) *atomic.Int64 {
@@ -1288,6 +1318,9 @@ func (m *Manager) InvalidateOperationsConfig() {
 func fallbackScopes(scope domain.Scope) []domain.Scope {
 	if scope == domain.ScopeWebAsset {
 		return []domain.Scope{domain.ScopeWebAsset, domain.ScopeWeb}
+	}
+	if scope == domain.ScopeConsoleAsset {
+		return []domain.Scope{domain.ScopeConsoleAsset, domain.ScopeConsole, domain.ScopeWeb}
 	}
 	if scope == domain.ScopeConsole {
 		// Console uses the same browser/clearance surface as Grok Web. A
@@ -1451,7 +1484,7 @@ func (m *Manager) createAndCacheClient(key clientCacheKey, id uint64, scope doma
 	}
 	if id != 0 && !sticky {
 		for previousKey, previous := range m.clients {
-			if previousKey.nodeID != id {
+			if previousKey.nodeID != id || previousKey.scope != key.scope {
 				continue
 			}
 			// Keep other accounts' pools when isolation is on.
@@ -1586,6 +1619,16 @@ func (m *Manager) Feedback(ctx context.Context, nodeID uint64, status int, trans
 
 func (m *Manager) FeedbackForScope(ctx context.Context, scope domain.Scope, nodeID uint64, status int, transportErr error) {
 	if status == clientClosedRequestStatus || errors.Is(transportErr, context.Canceled) {
+		return
+	}
+	// Console media hosts are public and do not use clearance credentials. A
+	// 403 there commonly describes the object URL (expired, rejected, or
+	// missing), not the proxy's ability to reach the origin, so it must not cool
+	// or rotate an otherwise healthy primary Console node.
+	if scope == domain.ScopeConsoleAsset && transportErr == nil && status == http.StatusForbidden {
+		return
+	}
+	if neterrorpkg.IsUpstreamStreamIdleTimeout(transportErr) {
 		return
 	}
 	if scope == domain.ScopeBuild && neterrorpkg.IsResponseHeaderTimeout(transportErr) {
@@ -1775,7 +1818,14 @@ func (m *Manager) ensureClearance(ctx context.Context, node domain.Node, proxyUR
 		state.lastUsedAt = now
 		m.clearances[key] = state
 	}
-	if cfg.Mode != "flaresolverr" {
+	if cfg.Mode == "on_demand" && !forceRefresh {
+		m.clearanceMu.Unlock()
+		if fallbackAllowed {
+			return fallback.Cookies, fallback.UserAgent, nil
+		}
+		return existingCookies, existingUserAgent, nil
+	}
+	if cfg.Mode != "flaresolverr" && cfg.Mode != "on_demand" {
 		m.clearanceMu.Unlock()
 		return existingCookies, existingUserAgent, nil
 	}
@@ -1801,7 +1851,7 @@ func (m *Manager) refreshNode(ctx context.Context, node domain.Node, proxyURL, k
 	solver := m.solver
 	lock := m.clearanceLock
 	m.clearanceMu.Unlock()
-	if cfg.Mode != "flaresolverr" {
+	if cfg.Mode != "flaresolverr" && cfg.Mode != "on_demand" {
 		return clearanceSolution{}, errors.New("FlareSolverr Clearance 未启用")
 	}
 	timeout := cfg.Timeout
@@ -1832,8 +1882,12 @@ func (m *Manager) refreshNode(ctx context.Context, node domain.Node, proxyURL, k
 			return clearanceSolution{}, errors.New("另一个实例正在刷新 Cloudflare Clearance")
 		}
 		defer release()
-		if !force {
-			if solution, refreshedAt, ok := m.loadPersistedClearance(ctx, node.ID, fingerprint, bindingFingerprint, interval); ok {
+		if solution, refreshedAt, ok := m.loadPersistedClearance(ctx, node.ID, fingerprint, bindingFingerprint, interval); ok {
+			// A peer may have refreshed the rejected Clearance immediately before
+			// this instance acquired the distributed lock. Reuse that newer result
+			// instead of performing a duplicate browser solve. A force refresh with
+			// no newer persisted generation must still reach the solver.
+			if !force || (!refreshAfter.IsZero() && refreshedAt.After(refreshAfter)) {
 				m.cacheClearance(key, solution, refreshedAt, solveVersion, fingerprint, bindingFingerprint, interval)
 				return solution, nil
 			}
@@ -2116,7 +2170,7 @@ func (m *Manager) ForgetClearances(nodeIDs []uint64) {
 	if m.nodeVersions == nil {
 		m.nodeVersions = make(map[domain.Scope]uint64)
 	}
-	for _, scope := range []domain.Scope{domain.ScopeBuild, domain.ScopeWeb, domain.ScopeConsole, domain.ScopeWebAsset} {
+	for _, scope := range allEgressScopes() {
 		m.nodeVersions[scope]++
 	}
 	clear(m.nodes)
@@ -2224,6 +2278,10 @@ func (m *Manager) RefreshDueClearances(ctx context.Context, force bool) error {
 
 func isGrokWebScope(scope domain.Scope) bool {
 	return scope == domain.ScopeWeb || scope == domain.ScopeWebAsset || scope == domain.ScopeConsole
+}
+
+func allEgressScopes() []domain.Scope {
+	return []domain.Scope{domain.ScopeBuild, domain.ScopeWeb, domain.ScopeConsole, domain.ScopeWebAsset, domain.ScopeConsoleAsset}
 }
 
 func (m *Manager) isStickyProxyNode(value domain.Node) bool {

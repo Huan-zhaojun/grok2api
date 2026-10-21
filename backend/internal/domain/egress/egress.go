@@ -15,10 +15,11 @@ const LastErrorTransport = "transport error"
 type Scope string
 
 const (
-	ScopeBuild    Scope = "grok_build"
-	ScopeWeb      Scope = "grok_web"
-	ScopeConsole  Scope = "grok_console"
-	ScopeWebAsset Scope = "grok_web_asset"
+	ScopeBuild        Scope = "grok_build"
+	ScopeWeb          Scope = "grok_web"
+	ScopeConsole      Scope = "grok_console"
+	ScopeWebAsset     Scope = "grok_web_asset"
+	ScopeConsoleAsset Scope = "grok_console_asset"
 )
 
 type Node struct {
@@ -30,6 +31,8 @@ type Node struct {
 	SourceID                    uint64
 	SourceKey                   string
 	AccountCapacity             int
+	ProxyProfileID              uint64
+	ProxyProfileName            string
 	EncryptedProxyURL           string
 	UserAgent                   string
 	EncryptedCloudflareCookie   string
@@ -59,9 +62,13 @@ type PublicNode struct {
 	Scope                Scope
 	Enabled              bool
 	ProxyConfigured      bool
+	ProxyDisplay         string
+	ProxyFingerprint     string
 	ProxyPool            bool
 	SourceID             uint64
 	AccountCapacity      int
+	ProxyProfileID       uint64
+	ProxyProfileName     string
 	UserAgent            string
 	CookieConfigured     bool
 	AccountBoundProxy    bool
@@ -80,6 +87,27 @@ type PublicNode struct {
 	AssignedAccountCount int
 	CreatedAt            time.Time
 	UpdatedAt            time.Time
+}
+
+// ProxyProfile is a reusable physical proxy configuration. Provider-specific
+// health, capacity, browser identity, and Clearance remain on Node.
+type ProxyProfile struct {
+	ID                uint64
+	Name              string
+	EncryptedProxyURL string
+	BoundNodeCount    int
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+}
+
+type PublicProxyProfile struct {
+	ID               uint64
+	Name             string
+	ProxyDisplay     string
+	ProxyFingerprint string
+	BoundNodeCount   int
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }
 
 type ProbeStatus string
@@ -130,6 +158,7 @@ type SubscriptionSource struct {
 	Scope                  Scope
 	Enabled                bool
 	EncryptedURL           string
+	EncryptedProxyURL      string
 	RefreshIntervalSeconds int
 	DefaultAccountCapacity int
 	LastSyncedAt           *time.Time
@@ -146,6 +175,7 @@ type PublicSubscriptionSource struct {
 	Scope                  Scope
 	Enabled                bool
 	URLConfigured          bool
+	ProxyConfigured        bool
 	RefreshIntervalSeconds int
 	DefaultAccountCapacity int
 	LastSyncedAt           *time.Time
@@ -227,10 +257,11 @@ func DefaultOperationsConfig() OperationsConfig {
 		ProbeIntervalSeconds:      900,
 		AssignmentIntervalSeconds: 300,
 		Fallbacks: map[Scope]FallbackConfig{
-			ScopeBuild:    {Mode: FallbackModeNone},
-			ScopeWeb:      {Mode: FallbackModeNone},
-			ScopeConsole:  {Mode: FallbackModeNone},
-			ScopeWebAsset: {Mode: FallbackModeNone},
+			ScopeBuild:        {Mode: FallbackModeNone},
+			ScopeWeb:          {Mode: FallbackModeNone},
+			ScopeConsole:      {Mode: FallbackModeNone},
+			ScopeWebAsset:     {Mode: FallbackModeNone},
+			ScopeConsoleAsset: {Mode: FallbackModeNone},
 		},
 	}
 }
@@ -247,11 +278,19 @@ func (value OperationsConfig) FallbackFor(scope Scope) FallbackConfig {
 }
 
 // SupportsScope reports whether a node can serve requests for the supplied
-// scope. Console may intentionally reuse a Web browser proxy, and Web assets
-// inherit a Web node when no asset-specific node is required.
+// scope. Console may intentionally reuse a Web browser proxy. Resource scopes
+// may reuse their provider's primary node so explicit account bindings remain
+// authoritative when no independently bound resource identity exists.
 func SupportsScope(nodeScope, requestScope Scope) bool {
 	if nodeScope == requestScope {
 		return true
 	}
-	return (requestScope == ScopeWebAsset || requestScope == ScopeConsole) && nodeScope == ScopeWeb
+	switch requestScope {
+	case ScopeWebAsset, ScopeConsole:
+		return nodeScope == ScopeWeb
+	case ScopeConsoleAsset:
+		return nodeScope == ScopeConsole || nodeScope == ScopeWeb
+	default:
+		return false
+	}
 }

@@ -162,6 +162,15 @@ func TestCanceledRequestDoesNotInvalidateDirectClient(t *testing.T) {
 	}
 }
 
+func TestConsoleAssetForbiddenDoesNotPenalizeProxy(t *testing.T) {
+	repository := &mutableEgressRepository{node: domain.Node{ID: 1, Name: "console", Scope: domain.ScopeConsole, Enabled: true, Health: 1}}
+	manager := NewManager(repository, nil)
+	manager.FeedbackForScope(context.Background(), domain.ScopeConsoleAsset, 1, http.StatusForbidden, nil)
+	if repository.updates != 0 || repository.node.Health != 1 || repository.node.CooldownUntil != nil {
+		t.Fatalf("Console asset object rejection changed proxy health: updates=%d node=%#v", repository.updates, repository.node)
+	}
+}
+
 func TestProbeEgressNodeLogsSuccessWithoutProxyCredentials(t *testing.T) {
 	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 	if err != nil {
@@ -1006,6 +1015,110 @@ func TestAcquireCredentialUsesExplicitBoundNode(t *testing.T) {
 	}
 }
 
+func TestConsoleAssetCredentialPrefersDedicatedNodeWithoutCookies(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encryptProxy := func(raw string) string {
+		t.Helper()
+		value, encryptErr := cipher.Encrypt(raw)
+		if encryptErr != nil {
+			t.Fatal(encryptErr)
+		}
+		return value
+	}
+	manager := NewManager(egressRepositoryTestStub{nodes: []domain.Node{
+		{ID: 1, Name: "web", Scope: domain.ScopeWeb, Enabled: true, Health: 1, EncryptedProxyURL: encryptProxy("http://web.example:8080")},
+		{ID: 2, Name: "console", Scope: domain.ScopeConsole, Enabled: true, Health: 1, EncryptedProxyURL: encryptProxy("http://console.example:8080")},
+		{ID: 3, Name: "console-assets", Scope: domain.ScopeConsoleAsset, Enabled: true, Health: 1, EncryptedProxyURL: encryptProxy("http://assets.example:8080"), EncryptedCloudflareCookie: "damaged-node-cookie", UserAgent: "asset-agent"},
+	}}, cipher)
+	lease, err := manager.AcquireCredential(context.Background(), domain.ScopeConsoleAsset, accountdomain.Credential{
+		ID: 42, Provider: accountdomain.ProviderConsole, EncryptedCloudflareCookie: "damaged-account-cookie",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.NodeID != 3 || lease.Scope != domain.ScopeConsoleAsset || lease.UserAgent != "asset-agent" {
+		t.Fatalf("asset lease = %#v", lease)
+	}
+	if lease.CFCookies != "" {
+		t.Fatalf("anonymous Console asset lease exposed cookies: %q", lease.CFCookies)
+	}
+}
+
+func TestConsoleAssetCredentialPreservesExplicitConsoleBinding(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundProxy, err := cipher.Encrypt("http://bound-console.example:8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assetProxy, err := cipher.Encrypt("http://assets.example:8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(egressRepositoryTestStub{nodes: []domain.Node{
+		{ID: 2, Name: "bound-console", Scope: domain.ScopeConsole, Enabled: true, Health: 1, EncryptedProxyURL: boundProxy},
+		{ID: 3, Name: "console-assets", Scope: domain.ScopeConsoleAsset, Enabled: true, Health: 1, EncryptedProxyURL: assetProxy},
+	}}, cipher)
+	lease, err := manager.AcquireCredential(context.Background(), domain.ScopeConsoleAsset, accountdomain.Credential{
+		ID: 42, Provider: accountdomain.ProviderConsole, EgressNodeID: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.NodeID != 2 || lease.NodeName != "bound-console" {
+		t.Fatalf("explicit Console binding was not preserved: node=%d name=%q", lease.NodeID, lease.NodeName)
+	}
+}
+
+func TestConsoleAssetClientDoesNotEvictPrimaryConsoleClient(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyURL, err := cipher.Encrypt("http://console.example:8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cookie, err := cipher.Encrypt("cf_clearance=console")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(egressRepositoryTestStub{nodes: []domain.Node{{
+		ID: 2, Name: "console", Scope: domain.ScopeConsole, Enabled: true, Health: 1, EncryptedProxyURL: proxyURL,
+	}}}, cipher)
+	credential := accountdomain.Credential{
+		ID: 42, Provider: accountdomain.ProviderConsole, EgressNodeID: 2, EncryptedCloudflareCookie: cookie,
+	}
+	primary, err := manager.AcquireCredential(context.Background(), domain.ScopeConsole, credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer primary.Release()
+	asset, err := manager.AcquireCredential(context.Background(), domain.ScopeConsoleAsset, credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer asset.Release()
+	primaryAgain, err := manager.AcquireCredential(context.Background(), domain.ScopeConsole, credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer primaryAgain.Release()
+	if primary.client != primaryAgain.client {
+		t.Fatal("Console asset download evicted the primary Console connection pool")
+	}
+	if primary.client == asset.client || len(manager.clients) != 2 {
+		t.Fatalf("primary and anonymous asset clients were not isolated: cached=%d", len(manager.clients))
+	}
+}
+
 func TestAcquireCredentialDoesNotRouteDirectWhenBoundNodeHasNoProxy(t *testing.T) {
 	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 	if err != nil {
@@ -1730,6 +1843,169 @@ func TestWebForbiddenStillRebuildsBrowserSession(t *testing.T) {
 	}
 	if managerHasClientForNode(manager, 1) {
 		t.Fatal("web browser session was not invalidated after 403")
+	}
+}
+
+func TestOnDemandClearanceRefreshesOnlyAfterRejection(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cookies, err := cipher.Encrypt("cf_clearance=existing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := &mutableEgressRepository{node: domain.Node{
+		ID: 1, Name: "console", Scope: domain.ScopeConsole, Enabled: true, Health: 1,
+		EncryptedCloudflareCookie: cookies, UserAgent: "Chrome/existing",
+	}}
+	solver := &clearanceSolverStub{}
+	manager := NewManager(repository, cipher)
+	manager.solver = solver
+	manager.UpdateClearanceConfig(ClearanceConfig{Mode: "on_demand", FlareSolverrURL: "http://solver", TargetURL: "https://grok.com", Timeout: time.Second, RefreshInterval: time.Hour})
+
+	first, err := manager.Acquire(context.Background(), domain.ScopeConsole, "account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if solver.calls != 0 || first.CFCookies != "cf_clearance=existing" {
+		t.Fatalf("initial calls=%d cookies=%q", solver.calls, first.CFCookies)
+	}
+	first.InvalidateClearance()
+	first.Release()
+
+	second, err := manager.Acquire(context.Background(), domain.ScopeConsole, "account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Release()
+	if solver.calls != 1 || second.CFCookies != "cf_clearance=value-1" {
+		t.Fatalf("refresh calls=%d cookies=%q", solver.calls, second.CFCookies)
+	}
+	stored, err := cipher.Decrypt(repository.node.EncryptedCloudflareCookie)
+	if err != nil || stored != "cf_clearance=value-1" {
+		t.Fatalf("stored cookies=%q err=%v", stored, err)
+	}
+}
+
+func TestOnDemandClearanceSkipsBackgroundRefresh(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := &mutableEgressRepository{node: domain.Node{ID: 1, Name: "console", Scope: domain.ScopeConsole, Enabled: true, Health: 1}}
+	solver := &clearanceSolverStub{}
+	manager := NewManager(repository, cipher)
+	manager.solver = solver
+	manager.UpdateClearanceConfig(ClearanceConfig{Mode: "on_demand", FlareSolverrURL: "http://solver", TargetURL: "https://grok.com", Timeout: time.Second, RefreshInterval: time.Nanosecond})
+
+	if err := manager.RefreshDueClearances(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	if solver.calls != 0 {
+		t.Fatalf("background refresh called solver %d times", solver.calls)
+	}
+}
+
+func TestOnDemandClearanceKeepsLastSuccessfulDirectSolutionPastRefreshInterval(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	solver := &clearanceSolverStub{}
+	manager := NewManager(egressRepositoryTestStub{}, cipher)
+	manager.solver = solver
+	manager.UpdateClearanceConfig(ClearanceConfig{
+		Mode: "on_demand", FlareSolverrURL: "http://solver", TargetURL: "https://grok.com",
+		Timeout: time.Second, RefreshInterval: time.Nanosecond,
+	})
+
+	initial, err := manager.Acquire(context.Background(), domain.ScopeConsole, "account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initial.CFCookies != "" || solver.calls != 0 {
+		t.Fatalf("initial lease cookies=%q calls=%d", initial.CFCookies, solver.calls)
+	}
+	initial.InvalidateClearance()
+	initial.Release()
+
+	refreshed, err := manager.Acquire(context.Background(), domain.ScopeConsole, "account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.CFCookies != "cf_clearance=value-1" || solver.calls != 1 {
+		t.Fatalf("refreshed lease cookies=%q calls=%d", refreshed.CFCookies, solver.calls)
+	}
+	refreshed.Release()
+
+	// The interval is deliberately expired. on_demand must keep using the last
+	// successful runtime-only solution until an upstream rejection invalidates it.
+	reused, err := manager.Acquire(context.Background(), domain.ScopeConsole, "account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reused.Release()
+	if reused.CFCookies != "cf_clearance=value-1" || reused.UserAgent != "Chrome/146 test" || solver.calls != 1 {
+		t.Fatalf("reused lease=%#v calls=%d", reused, solver.calls)
+	}
+}
+
+func TestOnDemandClearanceReusesPeerRefreshAfterDistributedLock(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := ClearanceConfig{
+		Mode: "on_demand", FlareSolverrURL: "http://solver", TargetURL: "https://grok.com",
+		Timeout: time.Second, RefreshInterval: time.Hour,
+	}
+	oldCookies, err := cipher.Encrypt("cf_clearance=old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldRefreshedAt := time.Now().UTC().Add(-time.Minute)
+	repository := &mutableEgressRepository{node: domain.Node{
+		ID: 1, Name: "console", Scope: domain.ScopeConsole, Enabled: true, Health: 1,
+		EncryptedCloudflareCookie: oldCookies, UserAgent: "Chrome/old",
+		ClearanceFingerprint: clearanceFingerprint(config, ""), ClearanceBindingFingerprint: clearanceBindingFingerprint(config, ""),
+		ClearanceRefreshedAt: &oldRefreshedAt,
+	}}
+	solver := &clearanceSolverStub{}
+	firstManager := NewManager(repository, cipher)
+	firstManager.solver = solver
+	firstManager.SetClearanceLock(alwaysAcquiredDistributedLock{})
+	firstManager.UpdateClearanceConfig(config)
+	secondManager := NewManager(repository, cipher)
+	secondManager.solver = solver
+	secondManager.SetClearanceLock(alwaysAcquiredDistributedLock{})
+	secondManager.UpdateClearanceConfig(config)
+
+	firstOld, err := firstManager.Acquire(context.Background(), domain.ScopeConsole, "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondOld, err := secondManager.Acquire(context.Background(), domain.ScopeConsole, "second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstOld.InvalidateClearance()
+	secondOld.InvalidateClearance()
+	firstOld.Release()
+	secondOld.Release()
+
+	firstFresh, err := firstManager.Acquire(context.Background(), domain.ScopeConsole, "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstFresh.Release()
+	secondFresh, err := secondManager.Acquire(context.Background(), domain.ScopeConsole, "second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondFresh.Release()
+	if solver.calls != 1 || secondFresh.CFCookies != "cf_clearance=value-1" {
+		t.Fatalf("peer refresh was not reused: calls=%d cookies=%q", solver.calls, secondFresh.CFCookies)
 	}
 }
 

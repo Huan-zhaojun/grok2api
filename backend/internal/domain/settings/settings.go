@@ -6,7 +6,27 @@ const (
 	DefaultBuildResponseHeaderTimeout = 5 * time.Minute
 	MinBuildResponseHeaderTimeout     = 30 * time.Second
 	MaxBuildResponseHeaderTimeout     = 30 * time.Minute
+
+	DefaultBuildStreamIdleTimeout = 2 * time.Minute
+	MinBuildStreamIdleTimeout     = 30 * time.Second
+	MaxBuildStreamIdleTimeout     = 10 * time.Minute
+
+	DefaultWebStreamIdleTimeout     = 90 * time.Second
+	DefaultConsoleStreamIdleTimeout = 2 * time.Minute
+	MinProviderStreamIdleTimeout    = 30 * time.Second
+	MaxProviderStreamIdleTimeout    = 10 * time.Minute
+
+	DefaultWebFreeVideoDurationCap = 6
+	MinWebFreeVideoDurationCap     = 1
+	MaxWebFreeVideoDurationCap     = 15
 )
+
+func NormalizeWebFreeVideoDurationCap(value int) int {
+	if value < MinWebFreeVideoDurationCap || value > MaxWebFreeVideoDurationCap {
+		return DefaultWebFreeVideoDurationCap
+	}
+	return value
+}
 
 // Config 表示可跨重启持久化并支持热加载的网关运行参数。
 type Config struct {
@@ -34,8 +54,9 @@ type FrontendConfig struct {
 }
 
 type ProviderConsoleConfig struct {
-	BaseURL     string
-	ChatTimeout time.Duration
+	BaseURL           string
+	ChatTimeout       time.Duration
+	StreamIdleTimeout time.Duration
 }
 
 type MediaConfig struct {
@@ -46,22 +67,24 @@ type MediaConfig struct {
 }
 
 type ProviderWebConfig struct {
-	BaseURL             string
-	StatsigMode         string
-	StatsigManualValue  string
-	StatsigSignerURL    string
-	ClearanceMode       string
-	FlareSolverrURL     string
-	ClearanceTimeout    time.Duration
-	ClearanceRefresh    time.Duration
-	QuotaTimeout        time.Duration
-	ChatTimeout         time.Duration
-	ImageTimeout        time.Duration
-	VideoTimeout        time.Duration
-	MediaConcurrency    int
-	AllowNSFW           bool
-	RecoveryBackoffBase time.Duration
-	RecoveryBackoffMax  time.Duration
+	BaseURL              string
+	StatsigMode          string
+	StatsigManualValue   string
+	StatsigSignerURL     string
+	ClearanceMode        string
+	FlareSolverrURL      string
+	ClearanceTimeout     time.Duration
+	ClearanceRefresh     time.Duration
+	QuotaTimeout         time.Duration
+	ChatTimeout          time.Duration
+	StreamIdleTimeout    time.Duration
+	ImageTimeout         time.Duration
+	VideoTimeout         time.Duration
+	MediaConcurrency     int
+	AllowNSFW            bool
+	FreeVideoDurationCap int
+	RecoveryBackoffBase  time.Duration
+	RecoveryBackoffMax   time.Duration
 }
 
 // BatchConfig 定义账号导入、转换、同步和凭据刷新的并发上限。
@@ -82,16 +105,18 @@ type ProviderBuildConfig struct {
 	TokenAuth             string
 	UserAgent             string
 	ResponseHeaderTimeout time.Duration
+	StreamIdleTimeout     time.Duration
 }
 
 // RoutingConfig 定义会话粘性、冷却和故障切换边界。
 type RoutingConfig struct {
-	StickyTTL       time.Duration
-	CooldownBase    time.Duration
-	CooldownMax     time.Duration
-	CapacityWait    time.Duration
-	MaxAttempts     int
-	PreferFreeBuild bool
+	StickyTTL        time.Duration
+	CooldownBase     time.Duration
+	CooldownMax      time.Duration
+	CapacityWait     time.Duration
+	MaxAttempts      int
+	VideoMaxAttempts int
+	PreferFreeBuild  bool
 	// MarkBuildChatDeniedAsReauth 为 true 时，Build chat 权限拒绝标 reauthRequired，默认 false 保留模型级冷却。
 	MarkBuildChatDeniedAsReauth bool
 	// AccountIsolatedConnections is optional so persisted payloads written by
@@ -111,6 +136,7 @@ type AuditConfig struct {
 	BatchSize     int
 	FlushInterval time.Duration
 	CommitDelay   time.Duration
+	RetentionDays *int
 }
 
 // ClientKeyDefaultsConfig 定义新建客户端密钥的默认限制。
@@ -121,10 +147,16 @@ type ClientKeyDefaultsConfig struct {
 
 // AccountsConfig 定义账号池后台维护策略；默认全部关闭。
 type AccountsConfig struct {
+	// AutoDisableDegradedAccounts is optional so legacy persisted settings keep
+	// the qualityGuard.requestRetry.autoDisable value supplied by config.yaml.
+	AutoDisableDegradedAccounts *bool
 	// MarkBuildForbiddenReauth marks high-confidence Grok Build permission denials as requiring reauthorization.
 	MarkBuildForbiddenReauth bool
 	// BuildForbiddenReauthCodes contains exact upstream error codes that opt into account invalidation.
 	BuildForbiddenReauthCodes []string
+	// ExcludeBuildBotFlaggedFromScheduling 为 true 时，bot_flag_source/bfs∈{1,2} 的 Build 账号不参与调度。
+	// 仅影响 ProviderBuild 选号；关联 Web/Console 账号调度不受影响。
+	ExcludeBuildBotFlaggedFromScheduling bool
 	// AutoCleanReauthEnabled 为 true 时，周期性删除已标记 reauthRequired 且超过 minAge 的账号。
 	AutoCleanReauthEnabled bool
 	// AutoCleanReauthInterval 自动清理扫描间隔。

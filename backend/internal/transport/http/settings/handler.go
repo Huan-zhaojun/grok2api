@@ -39,8 +39,9 @@ type serverConfigDTO struct {
 }
 
 type providerConsoleConfigDTO struct {
-	BaseURL     string `json:"baseURL"`
-	ChatTimeout string `json:"chatTimeout"`
+	BaseURL           string `json:"baseURL"`
+	ChatTimeout       string `json:"chatTimeout"`
+	StreamIdleTimeout string `json:"streamIdleTimeout"`
 }
 
 type mediaConfigDTO struct {
@@ -63,6 +64,7 @@ type providerBuildConfigDTO struct {
 	TokenAuthConfigured   bool   `json:"tokenAuthConfigured"`
 	UserAgent             string `json:"userAgent"`
 	ResponseHeaderTimeout string `json:"responseHeaderTimeout"`
+	StreamIdleTimeout     string `json:"streamIdleTimeout"`
 }
 
 type providerWebConfigDTO struct {
@@ -77,10 +79,12 @@ type providerWebConfigDTO struct {
 	ClearanceRefresh        *string `json:"clearanceRefresh,omitempty"`
 	QuotaTimeout            string  `json:"quotaTimeout"`
 	ChatTimeout             string  `json:"chatTimeout"`
+	StreamIdleTimeout       string  `json:"streamIdleTimeout"`
 	ImageTimeout            string  `json:"imageTimeout"`
 	VideoTimeout            string  `json:"videoTimeout"`
 	MediaConcurrency        int     `json:"mediaConcurrency"`
 	AllowNSFW               bool    `json:"allowNSFW"`
+	FreeVideoDurationCap    *int    `json:"freeVideoDurationCap,omitempty"`
 	RecoveryBackoffBase     string  `json:"recoveryBackoffBase"`
 	RecoveryBackoffMax      string  `json:"recoveryBackoffMax"`
 }
@@ -99,6 +103,7 @@ type routingConfigDTO struct {
 	CooldownMax                 string                      `json:"cooldownMax"`
 	CapacityWait                string                      `json:"capacityWait"`
 	MaxAttempts                 int                         `json:"maxAttempts"`
+	VideoMaxAttempts            int                         `json:"videoMaxAttempts"`
 	PreferFreeBuild             bool                        `json:"preferFreeBuild"`
 	MarkBuildChatDeniedAsReauth *bool                       `json:"markBuildChatDeniedAsReauth,omitempty"`
 	AccountIsolatedConnections  *bool                       `json:"accountIsolatedConnections,omitempty"`
@@ -116,6 +121,7 @@ type auditConfigDTO struct {
 	BatchSize     int    `json:"batchSize"`
 	FlushInterval string `json:"flushInterval"`
 	CommitDelayMS int    `json:"commitDelayMS"`
+	RetentionDays *int   `json:"retentionDays,omitempty"`
 }
 
 type clientKeyDefaultsConfigDTO struct {
@@ -124,12 +130,14 @@ type clientKeyDefaultsConfigDTO struct {
 }
 
 type accountsConfigDTO struct {
-	MarkBuildForbiddenReauth  *bool     `json:"markBuildForbiddenReauth,omitempty"`
-	BuildForbiddenReauthCodes *[]string `json:"buildForbiddenReauthCodes,omitempty"`
-	AutoCleanReauthEnabled    bool      `json:"autoCleanReauthEnabled"`
-	AutoCleanReauthInterval   string    `json:"autoCleanReauthInterval"`
-	AutoCleanReauthMinAge     string    `json:"autoCleanReauthMinAge"`
-	AutoCleanIncludeDisabled  bool      `json:"autoCleanIncludeDisabled"`
+	AutoDisableDegradedAccounts          *bool     `json:"autoDisableDegradedAccounts,omitempty"`
+	MarkBuildForbiddenReauth             *bool     `json:"markBuildForbiddenReauth,omitempty"`
+	BuildForbiddenReauthCodes            *[]string `json:"buildForbiddenReauthCodes,omitempty"`
+	ExcludeBuildBotFlaggedFromScheduling *bool     `json:"excludeBuildBotFlaggedFromScheduling,omitempty"`
+	AutoCleanReauthEnabled               bool      `json:"autoCleanReauthEnabled"`
+	AutoCleanReauthInterval              string    `json:"autoCleanReauthInterval"`
+	AutoCleanReauthMinAge                string    `json:"autoCleanReauthMinAge"`
+	AutoCleanIncludeDisabled             bool      `json:"autoCleanIncludeDisabled"`
 }
 
 type settingsResponse struct {
@@ -186,6 +194,7 @@ func (value settingsConfigDTO) toApplication() settingsapp.EditableConfig {
 			ClientVersion: value.ProviderBuild.ClientVersion, ClientIdentifier: value.ProviderBuild.ClientIdentifier,
 			TokenAuth: value.ProviderBuild.TokenAuth, UserAgent: value.ProviderBuild.UserAgent,
 			ResponseHeaderTimeout: value.ProviderBuild.ResponseHeaderTimeout,
+			StreamIdleTimeout:     value.ProviderBuild.StreamIdleTimeout,
 		},
 		ProviderWeb: settingsapp.ProviderWebConfig{
 			BaseURL: value.ProviderWeb.BaseURL, QuotaTimeout: value.ProviderWeb.QuotaTimeout,
@@ -194,13 +203,17 @@ func (value settingsConfigDTO) toApplication() settingsapp.EditableConfig {
 			ClearanceMode: optionalString(value.ProviderWeb.ClearanceMode), FlareSolverrURL: optionalString(value.ProviderWeb.FlareSolverrURL),
 			ClearanceTimeout: optionalString(value.ProviderWeb.ClearanceTimeout), ClearanceRefresh: optionalString(value.ProviderWeb.ClearanceRefresh),
 			ClearanceProvided: clearanceProvided,
-			ChatTimeout:       value.ProviderWeb.ChatTimeout, ImageTimeout: value.ProviderWeb.ImageTimeout,
+			ChatTimeout:       value.ProviderWeb.ChatTimeout, StreamIdleTimeout: value.ProviderWeb.StreamIdleTimeout,
+			ImageTimeout:     value.ProviderWeb.ImageTimeout,
 			VideoTimeout:     value.ProviderWeb.VideoTimeout,
 			MediaConcurrency: value.ProviderWeb.MediaConcurrency, AllowNSFW: value.ProviderWeb.AllowNSFW,
-			RecoveryBackoffBase: value.ProviderWeb.RecoveryBackoffBase, RecoveryBackoffMax: value.ProviderWeb.RecoveryBackoffMax,
+			FreeVideoDurationCap:         intValue(value.ProviderWeb.FreeVideoDurationCap),
+			FreeVideoDurationCapProvided: value.ProviderWeb.FreeVideoDurationCap != nil,
+			RecoveryBackoffBase:          value.ProviderWeb.RecoveryBackoffBase, RecoveryBackoffMax: value.ProviderWeb.RecoveryBackoffMax,
 		},
 		ProviderConsole: settingsapp.ProviderConsoleConfig{
 			BaseURL: value.ProviderConsole.BaseURL, ChatTimeout: value.ProviderConsole.ChatTimeout,
+			StreamIdleTimeout: value.ProviderConsole.StreamIdleTimeout,
 		},
 		Batch: settingsapp.BatchConfig{
 			ImportConcurrency: value.Batch.ImportConcurrency, ConversionConcurrency: value.Batch.ConversionConcurrency,
@@ -216,7 +229,7 @@ func (value settingsConfigDTO) toApplication() settingsapp.EditableConfig {
 		},
 		Routing: settingsapp.RoutingConfig{
 			StickyTTL: value.Routing.StickyTTL, CooldownBase: value.Routing.CooldownBase,
-			CooldownMax: value.Routing.CooldownMax, CapacityWait: value.Routing.CapacityWait, MaxAttempts: value.Routing.MaxAttempts,
+			CooldownMax: value.Routing.CooldownMax, CapacityWait: value.Routing.CapacityWait, MaxAttempts: value.Routing.MaxAttempts, VideoMaxAttempts: value.Routing.VideoMaxAttempts,
 			PreferFreeBuild:                     value.Routing.PreferFreeBuild,
 			MarkBuildChatDeniedAsReauth:         boolValue(value.Routing.MarkBuildChatDeniedAsReauth),
 			MarkBuildChatDeniedAsReauthProvided: value.Routing.MarkBuildChatDeniedAsReauth != nil,
@@ -225,6 +238,7 @@ func (value settingsConfigDTO) toApplication() settingsapp.EditableConfig {
 		},
 		Audit: settingsapp.AuditConfig{
 			BufferSize: value.Audit.BufferSize, BatchSize: value.Audit.BatchSize, FlushInterval: value.Audit.FlushInterval, CommitDelayMS: value.Audit.CommitDelayMS,
+			RetentionDays: intValue(value.Audit.RetentionDays), RetentionDaysProvided: value.Audit.RetentionDays != nil,
 		},
 		ClientKeyDefaults: settingsapp.ClientKeyDefaultsConfig{
 			RPMLimit: value.ClientKeyDefaults.RPMLimit, MaxConcurrent: value.ClientKeyDefaults.MaxConcurrent,
@@ -239,14 +253,18 @@ func (value settingsConfigDTO) toApplication() settingsapp.EditableConfig {
 	}
 	if value.Accounts != nil {
 		result.Accounts = settingsapp.AccountsConfig{
-			MarkBuildForbiddenReauth:          boolValue(value.Accounts.MarkBuildForbiddenReauth),
-			BuildForbiddenReauthCodes:         stringSliceValue(value.Accounts.BuildForbiddenReauthCodes),
-			MarkBuildForbiddenReauthProvided:  value.Accounts.MarkBuildForbiddenReauth != nil,
-			BuildForbiddenReauthCodesProvided: value.Accounts.BuildForbiddenReauthCodes != nil,
-			AutoCleanReauthEnabled:            value.Accounts.AutoCleanReauthEnabled,
-			AutoCleanReauthInterval:           value.Accounts.AutoCleanReauthInterval,
-			AutoCleanReauthMinAge:             value.Accounts.AutoCleanReauthMinAge,
-			AutoCleanIncludeDisabled:          value.Accounts.AutoCleanIncludeDisabled,
+			AutoDisableDegradedAccounts:                  boolValue(value.Accounts.AutoDisableDegradedAccounts),
+			AutoDisableDegradedAccountsProvided:          value.Accounts.AutoDisableDegradedAccounts != nil,
+			MarkBuildForbiddenReauth:                     boolValue(value.Accounts.MarkBuildForbiddenReauth),
+			BuildForbiddenReauthCodes:                    stringSliceValue(value.Accounts.BuildForbiddenReauthCodes),
+			ExcludeBuildBotFlaggedFromScheduling:         boolValue(value.Accounts.ExcludeBuildBotFlaggedFromScheduling),
+			MarkBuildForbiddenReauthProvided:             value.Accounts.MarkBuildForbiddenReauth != nil,
+			BuildForbiddenReauthCodesProvided:            value.Accounts.BuildForbiddenReauthCodes != nil,
+			ExcludeBuildBotFlaggedFromSchedulingProvided: value.Accounts.ExcludeBuildBotFlaggedFromScheduling != nil,
+			AutoCleanReauthEnabled:                       value.Accounts.AutoCleanReauthEnabled,
+			AutoCleanReauthInterval:                      value.Accounts.AutoCleanReauthInterval,
+			AutoCleanReauthMinAge:                        value.Accounts.AutoCleanReauthMinAge,
+			AutoCleanIncludeDisabled:                     value.Accounts.AutoCleanIncludeDisabled,
 		}
 		result.AccountsProvided = true
 	}
@@ -264,6 +282,7 @@ func newSettingsResponse(value settingsapp.Snapshot) settingsResponse {
 				TokenAuth:           config.ProviderBuild.TokenAuth,
 				TokenAuthConfigured: strings.TrimSpace(config.ProviderBuild.TokenAuth) != "", UserAgent: config.ProviderBuild.UserAgent,
 				ResponseHeaderTimeout: config.ProviderBuild.ResponseHeaderTimeout,
+				StreamIdleTimeout:     config.ProviderBuild.StreamIdleTimeout,
 			},
 			ProviderWeb: providerWebConfigDTO{
 				BaseURL: config.ProviderWeb.BaseURL, QuotaTimeout: config.ProviderWeb.QuotaTimeout,
@@ -271,13 +290,16 @@ func newSettingsResponse(value settingsapp.Snapshot) settingsResponse {
 				StatsigSignerURL: config.ProviderWeb.StatsigSignerURL,
 				ClearanceMode:    stringPointer(config.ProviderWeb.ClearanceMode), FlareSolverrURL: stringPointer(config.ProviderWeb.FlareSolverrURL),
 				ClearanceTimeout: stringPointer(config.ProviderWeb.ClearanceTimeout), ClearanceRefresh: stringPointer(config.ProviderWeb.ClearanceRefresh),
-				ChatTimeout: config.ProviderWeb.ChatTimeout, ImageTimeout: config.ProviderWeb.ImageTimeout,
+				ChatTimeout: config.ProviderWeb.ChatTimeout, StreamIdleTimeout: config.ProviderWeb.StreamIdleTimeout,
+				ImageTimeout:     config.ProviderWeb.ImageTimeout,
 				VideoTimeout:     config.ProviderWeb.VideoTimeout,
 				MediaConcurrency: config.ProviderWeb.MediaConcurrency, AllowNSFW: config.ProviderWeb.AllowNSFW,
-				RecoveryBackoffBase: config.ProviderWeb.RecoveryBackoffBase, RecoveryBackoffMax: config.ProviderWeb.RecoveryBackoffMax,
+				FreeVideoDurationCap: intPointer(config.ProviderWeb.FreeVideoDurationCap),
+				RecoveryBackoffBase:  config.ProviderWeb.RecoveryBackoffBase, RecoveryBackoffMax: config.ProviderWeb.RecoveryBackoffMax,
 			},
 			ProviderConsole: providerConsoleConfigDTO{
 				BaseURL: config.ProviderConsole.BaseURL, ChatTimeout: config.ProviderConsole.ChatTimeout,
+				StreamIdleTimeout: config.ProviderConsole.StreamIdleTimeout,
 			},
 			Batch: batchConfigDTO{
 				ImportConcurrency: config.Batch.ImportConcurrency, ConversionConcurrency: config.Batch.ConversionConcurrency,
@@ -293,7 +315,7 @@ func newSettingsResponse(value settingsapp.Snapshot) settingsResponse {
 			},
 			Routing: routingConfigDTO{
 				StickyTTL: config.Routing.StickyTTL, CooldownBase: config.Routing.CooldownBase,
-				CooldownMax: config.Routing.CooldownMax, CapacityWait: config.Routing.CapacityWait, MaxAttempts: config.Routing.MaxAttempts,
+				CooldownMax: config.Routing.CooldownMax, CapacityWait: config.Routing.CapacityWait, MaxAttempts: config.Routing.MaxAttempts, VideoMaxAttempts: config.Routing.VideoMaxAttempts,
 				MarkBuildChatDeniedAsReauth: boolPointer(config.Routing.MarkBuildChatDeniedAsReauth),
 				PreferFreeBuild:             config.Routing.PreferFreeBuild,
 				AccountIsolatedConnections:  boolPointer(config.Routing.AccountIsolatedConnections),
@@ -304,17 +326,20 @@ func newSettingsResponse(value settingsapp.Snapshot) settingsResponse {
 			},
 			Audit: auditConfigDTO{
 				BufferSize: config.Audit.BufferSize, BatchSize: config.Audit.BatchSize, FlushInterval: config.Audit.FlushInterval, CommitDelayMS: config.Audit.CommitDelayMS,
+				RetentionDays: intPointer(config.Audit.RetentionDays),
 			},
 			ClientKeyDefaults: clientKeyDefaultsConfigDTO{
 				RPMLimit: config.ClientKeyDefaults.RPMLimit, MaxConcurrent: config.ClientKeyDefaults.MaxConcurrent,
 			},
 			Accounts: &accountsConfigDTO{
-				MarkBuildForbiddenReauth:  boolPointer(config.Accounts.MarkBuildForbiddenReauth),
-				BuildForbiddenReauthCodes: stringSlicePointer(config.Accounts.BuildForbiddenReauthCodes),
-				AutoCleanReauthEnabled:    config.Accounts.AutoCleanReauthEnabled,
-				AutoCleanReauthInterval:   config.Accounts.AutoCleanReauthInterval,
-				AutoCleanReauthMinAge:     config.Accounts.AutoCleanReauthMinAge,
-				AutoCleanIncludeDisabled:  config.Accounts.AutoCleanIncludeDisabled,
+				AutoDisableDegradedAccounts:          boolPointer(config.Accounts.AutoDisableDegradedAccounts),
+				MarkBuildForbiddenReauth:             boolPointer(config.Accounts.MarkBuildForbiddenReauth),
+				BuildForbiddenReauthCodes:            stringSlicePointer(config.Accounts.BuildForbiddenReauthCodes),
+				ExcludeBuildBotFlaggedFromScheduling: boolPointer(config.Accounts.ExcludeBuildBotFlaggedFromScheduling),
+				AutoCleanReauthEnabled:               config.Accounts.AutoCleanReauthEnabled,
+				AutoCleanReauthInterval:              config.Accounts.AutoCleanReauthInterval,
+				AutoCleanReauthMinAge:                config.Accounts.AutoCleanReauthMinAge,
+				AutoCleanIncludeDisabled:             config.Accounts.AutoCleanIncludeDisabled,
 			},
 		},
 		RecommendedProviderBuild: providerBuildRecommendationDTO{
@@ -339,6 +364,15 @@ func boolPointer(value bool) *bool { return &value }
 func boolValue(value *bool) bool {
 	if value == nil {
 		return false
+	}
+	return *value
+}
+
+func intPointer(value int) *int { return &value }
+
+func intValue(value *int) int {
+	if value == nil {
+		return 0
 	}
 	return *value
 }

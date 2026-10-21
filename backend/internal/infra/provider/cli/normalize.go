@@ -6,17 +6,24 @@ import (
 	"fmt"
 	"strings"
 
+	auditdomain "github.com/chenyme/grok2api/backend/internal/domain/audit"
 	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
+	"github.com/chenyme/grok2api/backend/internal/infra/provider"
+	"github.com/chenyme/grok2api/backend/internal/infra/provider/conversation"
 )
 
 // normalizeResponsesRequest 改写路由字段和兼容别名，并为上游不支持的新工具协议建立请求级映射。
 func normalizeResponsesRequest(body []byte, model string) ([]byte, *responsesToolCompatibility, error) {
+	return normalizeResponsesRequestWithMetadata(body, model, nil)
+}
+
+func normalizeResponsesRequestWithMetadata(body []byte, model string, metadata *provider.NormalizedRequestMetadata) ([]byte, *responsesToolCompatibility, error) {
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, nil, fmt.Errorf("解析 Responses 请求: %w", err)
 	}
 	payload["model"] = mustJSON(model)
-	if _, err := normalizeBuildRequestPayload(payload, model); err != nil {
+	if _, err := normalizeBuildRequestPayloadWithMetadata(payload, model, conversation.OperationResponses, metadata); err != nil {
 		return nil, nil, err
 	}
 	if responseFormat, exists := payload["response_format"]; exists {
@@ -57,12 +64,16 @@ func normalizeResponsesRequest(body []byte, model string) ([]byte, *responsesToo
 
 // normalizeBuildRequest applies the stable compatibility boundary shared by Responses,
 // Chat Completions, and Anthropic Messages before the request reaches Grok Build.
-func normalizeBuildRequest(body []byte, model string) ([]byte, error) {
+func normalizeBuildRequest(body []byte, model, operation string) ([]byte, error) {
+	return normalizeBuildRequestWithMetadata(body, model, operation, nil)
+}
+
+func normalizeBuildRequestWithMetadata(body []byte, model, operation string, metadata *provider.NormalizedRequestMetadata) ([]byte, error) {
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, fmt.Errorf("解析 Build 请求: %w", err)
 	}
-	changed, err := normalizeBuildRequestPayload(payload, model)
+	changed, err := normalizeBuildRequestPayloadWithMetadata(payload, model, operation, metadata)
 	if err != nil {
 		return nil, err
 	}
@@ -72,7 +83,13 @@ func normalizeBuildRequest(body []byte, model string) ([]byte, error) {
 	return json.Marshal(payload)
 }
 
-func normalizeBuildRequestPayload(payload map[string]json.RawMessage, model string) (bool, error) {
+func normalizeBuildRequestPayload(payload map[string]json.RawMessage, model, operation string) (bool, error) {
+	return normalizeBuildRequestPayloadWithMetadata(payload, model, operation, nil)
+}
+
+func normalizeBuildRequestPayloadWithMetadata(payload map[string]json.RawMessage, model, operation string, metadata *provider.NormalizedRequestMetadata) (bool, error) {
+	requestedEffort := metadata != nil && auditdomain.NormalizeReasoningEffort(metadata.ReasoningEffort) != ""
+	requestedEffort = requestedEffort || hasRecognizedBuildReasoningEffort(payload)
 	changed := false
 	// client_metadata is a Codex transport envelope and may contain local paths,
 	// repository remotes, and installation/session identifiers. It is consumed by
@@ -84,11 +101,80 @@ func normalizeBuildRequestPayload(payload map[string]json.RawMessage, model stri
 	if normalizeBuildReasoningEffortPayload(payload, model) {
 		changed = true
 	}
+	// grok-build 1.0.4 always requests a concise reasoning summary from its
+	// Responses backend, even when it uses the model's default effort. Chat
+	// Completions has no separate summary parameter, so make that Build-specific
+	// compatibility contract explicit without changing native Responses,
+	// Console, or Web semantics.
+	if operation == conversation.OperationChat {
+		var reasoning map[string]json.RawMessage
+		if raw := payload["reasoning"]; !isEmptyJSON(raw) {
+			if err := json.Unmarshal(raw, &reasoning); err != nil {
+				return false, fmt.Errorf("解析 Build reasoning: %w", err)
+			}
+		}
+		if reasoning == nil {
+			reasoning = make(map[string]json.RawMessage)
+		}
+		if isEmptyJSON(reasoning["summary"]) {
+			reasoning["summary"] = mustJSON("concise")
+			payload["reasoning"] = mustJSON(reasoning)
+			changed = true
+		}
+	}
 	defaultsChanged, err := applyBuildResponseDefaults(payload)
 	if err != nil {
 		return false, err
 	}
+	updateBuildReasoningMetadata(payload, model, requestedEffort, metadata)
 	return changed || defaultsChanged, nil
+}
+
+func hasRecognizedBuildReasoningEffort(payload map[string]json.RawMessage) bool {
+	effort, ok := buildReasoningEffort(payload)
+	if !ok {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "auto", "none", "minimal", "low", "medium", "high", "xhigh", "max":
+		return true
+	default:
+		return false
+	}
+}
+
+func updateBuildReasoningMetadata(payload map[string]json.RawMessage, model string, requested bool, metadata *provider.NormalizedRequestMetadata) {
+	if metadata == nil {
+		return
+	}
+	previous := auditdomain.NormalizeReasoningEffort(metadata.ReasoningEffort)
+	metadata.ReasoningEffort = ""
+	if !requested {
+		return
+	}
+	if modeldomain.IsGrokComposerModel(model) {
+		metadata.ReasoningEffort = "fixed"
+		return
+	}
+	if effort, ok := buildReasoningEffort(payload); ok {
+		metadata.ReasoningEffort = auditdomain.NormalizeReasoningEffort(effort)
+		return
+	}
+	metadata.ReasoningEffort = previous
+}
+
+func buildReasoningEffort(payload map[string]json.RawMessage) (string, bool) {
+	raw := payload["reasoning"]
+	if isEmptyJSON(raw) {
+		return "", false
+	}
+	var reasoning struct {
+		Effort string `json:"effort"`
+	}
+	if json.Unmarshal(raw, &reasoning) != nil || strings.TrimSpace(reasoning.Effort) == "" {
+		return "", false
+	}
+	return reasoning.Effort, true
 }
 
 // applyBuildResponseDefaults mirrors the official Grok Build client boundary.
@@ -117,8 +203,11 @@ func applyBuildResponseDefaults(payload map[string]json.RawMessage) (bool, error
 }
 
 // normalizeBuildReasoningEffortPayload maps client aliases to levels accepted by
-// the selected Grok model. Grok 4.5 and unknown models retain the proven defensive
-// xhigh/max -> high behavior; explicitly supported xhigh models keep their value.
+// the selected Grok model. grok-build treats minimal/xhigh/max as distinct wire
+// tiers, so a tier the model's catalog menu lists is forwarded verbatim. Only
+// tiers the model does not offer are folded onto the nearest offered level:
+// minimal -> low, max -> xhigh -> high. Grok 4.5 and unknown models therefore
+// retain the proven defensive xhigh/max -> high behavior.
 func normalizeBuildReasoningEffortPayload(payload map[string]json.RawMessage, model string) bool {
 	raw, exists := payload["reasoning"]
 	if !exists || isEmptyJSON(raw) {
@@ -147,16 +236,15 @@ func normalizeBuildReasoningEffortPayload(payload map[string]json.RawMessage, mo
 	if err := json.Unmarshal(reasoning["effort"], &effort); err != nil {
 		return false
 	}
+	requested := strings.ToLower(strings.TrimSpace(effort))
 	var normalized string
-	switch strings.ToLower(strings.TrimSpace(effort)) {
-	case "xhigh":
-		if modeldomain.SupportsReasoningEffort(model, modeldomain.ReasoningEffortXHigh) {
-			normalized = modeldomain.ReasoningEffortXHigh
-		} else {
-			normalized = modeldomain.ReasoningEffortHigh
-		}
-	case "max":
-		normalized = modeldomain.ReasoningEffortHigh
+	switch requested {
+	case modeldomain.ReasoningEffortMinimal:
+		normalized = foldBuildReasoningEffort(model, modeldomain.ReasoningEffortMinimal, modeldomain.ReasoningEffortLow)
+	case modeldomain.ReasoningEffortXHigh:
+		normalized = foldBuildReasoningEffort(model, modeldomain.ReasoningEffortXHigh, modeldomain.ReasoningEffortHigh)
+	case modeldomain.ReasoningEffortMax:
+		normalized = foldBuildReasoningEffort(model, modeldomain.ReasoningEffortMax, modeldomain.ReasoningEffortXHigh, modeldomain.ReasoningEffortHigh)
 	default:
 		return false
 	}
@@ -166,6 +254,18 @@ func normalizeBuildReasoningEffortPayload(payload map[string]json.RawMessage, mo
 	reasoning["effort"] = mustJSON(normalized)
 	payload["reasoning"] = mustJSON(reasoning)
 	return true
+}
+
+// foldBuildReasoningEffort returns the first candidate tier the model offers,
+// falling back to the last candidate when none is offered. Candidates are
+// ordered from the requested tier down to the proven safe level.
+func foldBuildReasoningEffort(model string, candidates ...string) string {
+	for _, candidate := range candidates {
+		if modeldomain.SupportsReasoningEffort(model, candidate) {
+			return candidate
+		}
+	}
+	return candidates[len(candidates)-1]
 }
 
 // patchReasoningTextTypes 对齐官方 CLI 的序列化后修补：Responses 上游要求

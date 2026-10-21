@@ -140,9 +140,10 @@ make swagger   # 改 swag 注释后必跑
 
 CI：`.github/workflows/ghcr-image.yml`（test / vet / swagger / lint / build；push main 推镜像）；另有 `codeql.yml` / `stale.yml`。
 
-**Windows 开发注意**：
+**开发环境注意**：
 - `gofmt -l` 会因 CRLF 行尾（`text=auto`）把全仓列为"未格式化"，是误报；**禁止** `gofmt -w` 全仓，只格式化改动文件，提交时 git 自动归一 LF。
 - 高负载 runner 下偶发抖动：上游 `TestWebAccountScriptsRejectConcurrentWorkForTheSameAccount`（3s 墙钟超时 + 全仓最重包），CI 挂了先看是否与它无关，重跑即可。
+- **本地工具链常高于 CI**（`go` 行=最低版本，`toolchain` 行只能上调）：断言只依赖标准库**公开 API**，勿绑内部实现（如 `TLSNextProto["h2"]` 在 Go 1.27 让位于 `Transport.Protocols`）。
 
 ### 部署（Docker）
 
@@ -259,4 +260,6 @@ gh pr create --repo chenyme/grok2api --base main --head Huan-zhaojun:pr/<主题>
 | `backend/docs/` | Swagger 产物（`make swagger`） |
 | `docs/sso-account-invalidation.md` | SSO 失效语义与落库 |
 | `docs/deployment-bind-mount.md` | 部署挂载说明 |
+
+> `docs/` 为**本地态**目录：上游 `.gitignore` 的 `/docs/*` 使其内容不入库。
 

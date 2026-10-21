@@ -23,17 +23,21 @@
 #      "With --no-verify, the hook is bypassed completely."
 #   2. `git -c core.hooksPath=<其它目录> push ...` 把 hook 发现路径改向，等效绕过。
 #   3. git 别名内部若嵌了 `--no-verify`，同样绕过。
-#   4. 不经过 transport_push() 的底层命令不跑任何 hook —— 例如
+#   4. IDE（PyCharm / IntelliJ 等）推送对话框里的「运行 Git 挂钩」取消勾选，
+#      等效于 `--no-verify`，会静默绕过本 hook —— 它是最容易被手滑触发的一个
+#      （一个复选框）。保持勾选即与命令行行为一致。
+#   5. 不经过 transport_push() 的底层命令不跑任何 hook —— 例如
 #      `git send-pack <url> <refspec>`。此类需故意手打，不在防手滑范围内。
-#   5. 若本机 core.hooksPath 被设置（例如引入 husky），装在 .git/hooks 的守卫会被
+#   6. 若本机 core.hooksPath 被设置（例如引入 husky），装在 .git/hooks 的守卫会被
 #      静默忽略。安装后请确认 `git config --get core.hooksPath` 为空。
 #
 #   → 因此针对「绝不能推到上游」这一条，真正的硬断应做在 config 层：
 #       git remote set-url --push upstream "file:///nonexistent/grok2api-push-disabled.git"
-#     它不经过 hook，故 1~3 均绕不过；而 `git fetch upstream` 不受影响
-#     （pushurl 只作用于推送）。注意：该硬断生效时，`git push upstream` 会在
-#     transport 建立阶段就失败，**hook 根本不会被执行** —— 两道闸是短路关系，
-#     更硬的那道先响。
+#     它不经过 hook，故凡是以命名远端 upstream 发起的推送（上列 1~4、6）均绕不过；
+#     唯有第 5 类（直接用 URL 调底层命令，绕开远端配置）不在其覆盖面内。
+#     `git fetch upstream` 不受影响（pushurl 只作用于推送）。
+#     注意：该硬断生效时，`git push upstream` 会在 transport 建立阶段就失败，
+#     **hook 根本不会被执行** —— 两道闸是短路关系，更硬的那道先响。
 #
 # ── 自测 ───────────────────────────────────────────────────────────────
 #   bash tools/pre-push-guard-selftest.sh
